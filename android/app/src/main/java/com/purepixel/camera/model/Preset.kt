@@ -2,6 +2,12 @@ package com.purepixel.camera.model
 
 import android.graphics.Color
 
+enum class ProcessingMode {
+    NATURAL,
+    HOORU,
+    ANDROID
+}
+
 data class Preset(
     val id: String,
     val name: String,
@@ -9,13 +15,29 @@ data class Preset(
     val assetPath: String? = null,
     val lightroom: LightroomPreset? = null,
     val isCustom: Boolean = false,
-    val isAddButton: Boolean = false
+    val isAddButton: Boolean = false,
+    val intensity: Float = 1f,
+    val grain: Float = 0f,
+    val halation: Float = 0f,
+    val processingMode: ProcessingMode = ProcessingMode.HOORU
 ) {
     companion object {
         val DEFAULT_PRESETS = listOf(
+            Preset(
+                "no_filter",
+                "Natural",
+                Color.parseColor("#d7d7d7"),
+                processingMode = ProcessingMode.NATURAL
+            ),
+            Preset("hooru_look", "Hooru Look", Color.parseColor("#ff3b30")),
+            Preset(
+                "android_processing",
+                "Android Processing",
+                Color.parseColor("#8AB4F8"),
+                processingMode = ProcessingMode.ANDROID
+            ),
             Preset("leica_mono", "Leica Mono", Color.parseColor("#ffffff")),
             Preset("teal_orange", "Teal & Orange", Color.parseColor("#3b82f6")),
-            Preset("no_filter", "No Filter", Color.parseColor("#ff3b30")), // Default centered (3rd option)
             Preset("portra_400", "Portra 400", Color.parseColor("#ff9500")),
             Preset("classic_chrome", "Fuji Chrome", Color.parseColor("#34c759")),
             Preset("warm_fade", "Warm Fade", Color.parseColor("#ffcc80")),

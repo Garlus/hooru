@@ -33,15 +33,25 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
+data class PreviewAnalysis(
+    val luminanceHistogram: FloatArray = FloatArray(64),
+    val redWaveform: FloatArray = FloatArray(40),
+    val greenWaveform: FloatArray = FloatArray(40),
+    val blueWaveform: FloatArray = FloatArray(40)
+)
+
 class GLCameraView(
     context: Context,
     onSurfaceReady: (SurfaceTexture) -> Unit
 ) : GLSurfaceView(context) {
 
     @Volatile private var renderingActive = false
-    val renderer: LutShaderRenderer = LutShaderRenderer(onSurfaceReady) {
-        if (renderingActive) requestRender()
-    }
+    private var analysisListener: (PreviewAnalysis) -> Unit = { }
+    val renderer: LutShaderRenderer = LutShaderRenderer(
+        onSurfaceReady = onSurfaceReady,
+        requestRender = { if (renderingActive) requestRender() },
+        onAnalysis = { analysis -> mainHandler.post { analysisListener(analysis) } }
+    )
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lutExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "HooruLutBuilder").apply { priority = Thread.NORM_PRIORITY - 1 }
@@ -90,9 +100,12 @@ class GLCameraView(
 
     fun applyPreset(preset: Preset) {
         val generation = presetGeneration.incrementAndGet()
-        if (preset.id == "no_filter") {
+        if (preset.id == "no_filter" || preset.id == "android_processing") {
             queueEvent {
-                if (generation == presetGeneration.get()) renderer.disableLut()
+                if (generation == presetGeneration.get()) {
+                    renderer.disableLut()
+                    renderer.setLookControls(preset.intensity, preset.grain, preset.halation)
+                }
             }
             return
         }
@@ -112,8 +125,21 @@ class GLCameraView(
                 if (generation != presetGeneration.get()) return@queueEvent
                 preset.lightroom?.let { renderer.loadLightroomPreset(it, upload) }
                     ?: renderer.loadBuiltInPreset(upload)
+                renderer.setLookControls(preset.intensity, preset.grain, preset.halation)
             }
         }
+    }
+
+    fun setAssistSettings(zebraMode: Int, focusPeaking: Boolean) {
+        queueEvent { renderer.setAssistSettings(zebraMode, focusPeaking) }
+    }
+
+    fun setAnalysisListener(listener: (PreviewAnalysis) -> Unit) {
+        analysisListener = listener
+    }
+
+    fun setAnalysisEnabled(enabled: Boolean) {
+        queueEvent { renderer.setAnalysisEnabled(enabled) }
     }
 
     fun clearPreset() {
@@ -130,7 +156,8 @@ fun CameraPreviewGL(
     onSurfaceReady: (SurfaceTexture) -> Unit,
     onGLViewReady: (GLCameraView) -> Unit = { },
     onPreviewReady: (GLCameraView) -> Unit = { },
-    onPreviewFrame: (Bitmap) -> Unit = { }
+    onPreviewFrame: (Bitmap) -> Unit = { },
+    onPreviewAnalysis: (PreviewAnalysis) -> Unit = { }
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     var cameraView by remember { mutableStateOf<GLCameraView?>(null) }
@@ -142,6 +169,7 @@ fun CameraPreviewGL(
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
                 cameraView = this
+                setAnalysisListener(onPreviewAnalysis)
                 onGLViewReady(this)
                 onPreviewReady(this)
             }
@@ -166,8 +194,14 @@ fun CameraPreviewGL(
 }
 
 fun createPresetColorMatrix(presetId: String): ColorMatrix? {
-    if (presetId == "no_filter") return null
+    if (presetId == "no_filter" || presetId == "android_processing") return null
     return when (presetId) {
+        "hooru_look" -> ColorMatrix(floatArrayOf(
+            1.08f, 0.02f, 0.01f, 0f, 3f,
+            0.01f, 1.04f, 0.02f, 0f, 1f,
+            0.01f, 0.03f, 0.96f, 0f, -2f,
+            0f, 0f, 0f, 1f, 0f
+        ))
         "leica_mono" -> ColorMatrix().apply { setSaturation(0f) }
         "teal_orange" -> ColorMatrix(floatArrayOf(
             1.08f, 0f, 0.08f, 0f, 5f, 0f, 0.98f, 0.04f, 0f, 0f,

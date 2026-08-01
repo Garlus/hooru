@@ -7,6 +7,7 @@ import android.content.ContentUris
 import android.content.Intent
 import android.net.Uri
 import android.graphics.ImageFormat
+import android.graphics.ImageDecoder
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -32,11 +33,16 @@ import android.view.Surface
 import android.view.WindowManager
 import com.purepixel.camera.gl.createPresetColorMatrix
 import com.purepixel.camera.model.LightroomPreset
+import com.purepixel.camera.model.Preset
+import com.purepixel.camera.model.ProcessingMode
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.Locale
+import kotlin.math.pow
+import kotlin.math.roundToInt
 
 class CameraEngine(private val context: Context) {
 
@@ -47,7 +53,22 @@ class CameraEngine(private val context: Context) {
     data class TelemetryData(
         val iso: Int = 100,
         val shutterSpeed: String = "1/50",
-        val format: String = "JPG"
+        val exposureTimeNs: Long = 20_000_000L,
+        val format: String = "JPG",
+        val exposureCompensation: Float = 0f,
+        val isoManual: Boolean = false,
+        val shutterManual: Boolean = false
+    )
+
+    data class ExposureCapabilities(
+        val manualSensor: Boolean = false,
+        val minimumIso: Int = 50,
+        val maximumIso: Int = 6400,
+        val minimumExposureTimeNs: Long = 125_000L,
+        val maximumExposureTimeNs: Long = 1_000_000_000L,
+        val minimumCompensationEv: Float = -3f,
+        val maximumCompensationEv: Float = 3f,
+        val compensationStepEv: Float = 1f / 3f
     )
 
     data class GallerySaveState(
@@ -56,10 +77,31 @@ class CameraEngine(private val context: Context) {
         val failedRevision: Int = 0
     )
 
+    data class FocalLengthOption(
+        val millimeters: Float,
+        val zoomRatio: Float
+    )
+
     var onTelemetryListener: ((TelemetryData) -> Unit)? = null
+    var onRawCapabilityListener: ((Boolean) -> Unit)? = null
+    var onFocalLengthsListener: ((List<FocalLengthOption>) -> Unit)? = null
+    var onExposureCapabilitiesListener: ((ExposureCapabilities) -> Unit)? = null
     var onPreviewConfigurationListener: ((Size) -> Unit)? = null
     var onGallerySaveStateListener: ((GallerySaveState) -> Unit)? = null
+    var onHardwareShutterListener: (() -> Unit)? = null
     var currentPreviewSize: Size? = null
+        private set
+
+    @Volatile
+    var supportsRawCapture: Boolean = false
+        private set
+
+    @Volatile
+    var availableFocalLengths: List<FocalLengthOption> = emptyList()
+        private set
+
+    @Volatile
+    var exposureCapabilities: ExposureCapabilities = ExposureCapabilities()
         private set
 
     private var cameraManager: CameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -95,12 +137,16 @@ class CameraEngine(private val context: Context) {
     private var currentExposureTimeNs: Long = 20_000_000L
     private var baseAutoIso: Int = 400
     private var baseAutoExposureTimeNs: Long = 20_000_000L
-    var isIsoBoostEnabled: Boolean = false
-        private set
-    var isShutterBoostEnabled: Boolean = false
-        private set
+    private var manualIso: Int? = null
+    private var manualExposureTimeNs: Long? = null
+    private var exposureCompensationEv: Float = 0f
     private var activeFilterId: String = "no_filter"
     private var activeLightroomPreset: LightroomPreset? = null
+    private var activeLookIntensity: Float = 1f
+    private var activeLookGrain: Float = 0f
+    private var activeLookHalation: Float = 0f
+    private var activeProcessingMode: ProcessingMode = ProcessingMode.NATURAL
+    @Volatile var captureAspectRatio: Float = 3f / 4f
     var captureFormat: String = "JPG" // "JPG" | "RAW" | "RAW+JPG"
     var currentZoomRatio: Float = 1.0f
     var isFlashEnabled: Boolean = false
@@ -111,6 +157,28 @@ class CameraEngine(private val context: Context) {
     @Volatile private var previewStreamPaused: Boolean = false
     @Volatile private var cameraOpening: Boolean = false
     private var cameraGeneration: Int = 0
+
+    private fun updateRawCapability(supported: Boolean) {
+        supportsRawCapture = supported
+        if (!supported && captureFormat != "JPG") {
+            captureFormat = "JPG"
+        }
+        mainHandler.post { onRawCapabilityListener?.invoke(supported) }
+    }
+
+    private fun updateAvailableFocalLengths(options: List<FocalLengthOption>) {
+        availableFocalLengths = options
+        mainHandler.post { onFocalLengthsListener?.invoke(options) }
+    }
+
+    private fun updateExposureCapabilities(capabilities: ExposureCapabilities) {
+        exposureCapabilities = capabilities
+        if (!capabilities.manualSensor) {
+            manualIso = null
+            manualExposureTimeNs = null
+        }
+        mainHandler.post { onExposureCapabilitiesListener?.invoke(capabilities) }
+    }
 
     @Synchronized
     fun startBackgroundThread() {
@@ -166,6 +234,37 @@ class CameraEngine(private val context: Context) {
             activeCharacteristics = cameraManager.getCameraCharacteristics(backCameraId)
             val map = activeCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
+            val requestCapabilities = activeCharacteristics
+                ?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?: intArrayOf()
+            val isoRange = activeCharacteristics
+                ?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            val exposureRange = activeCharacteristics
+                ?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val compensationRange = activeCharacteristics
+                ?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+            val compensationStep = activeCharacteristics
+                ?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+                ?.toFloat()
+                ?.takeIf { it > 0f }
+                ?: 1f / 3f
+            updateExposureCapabilities(
+                ExposureCapabilities(
+                    manualSensor = requestCapabilities.contains(
+                        CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR
+                    ),
+                    minimumIso = isoRange?.lower ?: 50,
+                    maximumIso = isoRange?.upper ?: 6400,
+                    minimumExposureTimeNs = exposureRange?.lower ?: 125_000L,
+                    maximumExposureTimeNs = exposureRange?.upper ?: 1_000_000_000L,
+                    minimumCompensationEv = ((compensationRange?.lower ?: -9) * compensationStep)
+                        .coerceAtLeast(-3f),
+                    maximumCompensationEv = ((compensationRange?.upper ?: 9) * compensationStep)
+                        .coerceAtMost(3f),
+                    compensationStepEv = compensationStep
+                )
+            )
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 activeCharacteristics?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.let { range ->
                     minimumZoomRatio = range.lower
@@ -178,17 +277,51 @@ class CameraEngine(private val context: Context) {
                     ?: 1.0f
             }
 
+            fun equivalentFocalLengths(characteristics: CameraCharacteristics): List<Float> {
+                val physicalSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                val sensorWidth = physicalSize?.width?.takeIf { it > 0f } ?: return emptyList()
+                return (characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?: floatArrayOf())
+                    .filter { it.isFinite() && it > 0f }
+                    .map { actualMillimeters -> actualMillimeters * 36f / sensorWidth }
+            }
+            val active = requireNotNull(activeCharacteristics)
+            val primaryEquivalent = equivalentFocalLengths(active).firstOrNull()
+            val physicalEquivalents = active.physicalCameraIds.flatMap { physicalId ->
+                runCatching {
+                    equivalentFocalLengths(cameraManager.getCameraCharacteristics(physicalId))
+                }.getOrDefault(emptyList())
+            }
+            val equivalentFocalLengths = (physicalEquivalents + equivalentFocalLengths(active))
+                .filter { it.isFinite() && it > 0f }
+                .distinctBy { it.roundToInt() }
+                .sorted()
+            val focalLengthOptions = equivalentFocalLengths.mapNotNull { equivalent ->
+                val zoomRatio = if (primaryEquivalent != null && primaryEquivalent > 0f) {
+                    equivalent / primaryEquivalent
+                } else 1f
+                zoomRatio.takeIf { it in minimumZoomRatio..maximumZoomRatio }?.let {
+                    FocalLengthOption(
+                        millimeters = equivalent,
+                        zoomRatio = it
+                    )
+                }
+            }.ifEmpty {
+                primaryEquivalent?.let { listOf(FocalLengthOption(it, 1f)) }.orEmpty()
+            }
+            updateAvailableFocalLengths(focalLengthOptions)
+
             // Setup RAW and JPEG ImageReaders
-            val capabilities = activeCharacteristics?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                ?: intArrayOf()
-            val supportsRaw = capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
+            val supportsRaw = requestCapabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
             val rawSize = map?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width * it.height }
+            val rawCaptureSupported = supportsRaw && rawSize != null
+            updateRawCapability(rawCaptureSupported)
             val jpegSize = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height }
                 ?: Size(1920, 1440)
 
-            rawImageReader = if (supportsRaw && rawSize != null) {
-                ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2)
-            } else null
+            rawImageReader = rawSize?.takeIf { rawCaptureSupported }?.let { size ->
+                ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 2)
+            }
             jpegImageReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2)
 
             val previewSize = choosePreviewSize(map, width, height)
@@ -258,6 +391,14 @@ class CameraEngine(private val context: Context) {
         } else {
             CameraCharacteristics.LENS_FACING_BACK
         }
+        // The front and back cameras can expose different Camera2 capabilities.
+        // Hide RAW immediately while the newly selected camera is reopening.
+        updateRawCapability(false)
+        updateAvailableFocalLengths(emptyList())
+        manualIso = null
+        manualExposureTimeNs = null
+        exposureCompensationEv = 0f
+        updateExposureCapabilities(ExposureCapabilities())
         closeCamera()
         isFlashEnabled = false
         val texture = previewSurfaceTexture ?: return
@@ -289,9 +430,41 @@ class CameraEngine(private val context: Context) {
         }
     }
 
+    fun setCaptureFilter(preset: Preset) {
+        activeFilterId = preset.id
+        activeLightroomPreset = preset.lightroom
+        activeLookIntensity = preset.intensity
+        activeLookGrain = preset.grain
+        activeLookHalation = preset.halation
+        activeProcessingMode = preset.processingMode
+        applyProcessingModeToPreview()
+    }
+
     fun setCaptureFilter(presetId: String, lightroomPreset: LightroomPreset? = null) {
         activeFilterId = presetId
         activeLightroomPreset = lightroomPreset
+        activeLookIntensity = 1f
+        activeLookGrain = 0f
+        activeLookHalation = 0f
+        activeProcessingMode = if (presetId == "android_processing") {
+            ProcessingMode.ANDROID
+        } else if (presetId == "no_filter") {
+            ProcessingMode.NATURAL
+        } else {
+            ProcessingMode.HOORU
+        }
+        applyProcessingModeToPreview()
+    }
+
+    private fun applyProcessingModeToPreview() {
+        val builder = previewRequestBuilder ?: return
+        val session = captureSession ?: return
+        try {
+            applyImageProcessingPreference(builder)
+            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to update processing mode", e)
+        }
     }
 
     fun pausePreviewStream() {
@@ -309,9 +482,9 @@ class CameraEngine(private val context: Context) {
     }
 
     fun disableExposureBoosts() {
-        isIsoBoostEnabled = false
-        isShutterBoostEnabled = false
-        applyExposureBoost()
+        manualIso = null
+        manualExposureTimeNs = null
+        applyExposureControls()
     }
 
     fun meterAndFocus(normalizedX: Float, normalizedY: Float) {
@@ -319,7 +492,6 @@ class CameraEngine(private val context: Context) {
         val session = captureSession ?: return
         val sensor = activeCharacteristics
             ?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
-        disableExposureBoosts()
         val generation = ++meteringGeneration
         val crop = cropRectForZoom(sensor, currentZoomRatio)
         var displayX = normalizedX.coerceIn(0f, 1f)
@@ -421,81 +593,90 @@ class CameraEngine(private val context: Context) {
         return Rect(left, top, left + width, top + height)
     }
 
-    fun toggleIsoBoost(): Boolean {
-        isIsoBoostEnabled = !isIsoBoostEnabled
-        applyExposureBoost()
-        return isIsoBoostEnabled
+    fun setManualIso(iso: Int?) {
+        manualIso = iso?.coerceIn(
+            exposureCapabilities.minimumIso,
+            exposureCapabilities.maximumIso
+        )?.takeIf { exposureCapabilities.manualSensor }
+        applyExposureControls()
     }
 
-    fun toggleShutterBoost(): Boolean {
-        isShutterBoostEnabled = !isShutterBoostEnabled
-        applyExposureBoost()
-        return isShutterBoostEnabled
+    fun setManualExposureTime(exposureTimeNs: Long?) {
+        manualExposureTimeNs = exposureTimeNs?.coerceIn(
+            exposureCapabilities.minimumExposureTimeNs,
+            exposureCapabilities.maximumExposureTimeNs
+        )?.takeIf { exposureCapabilities.manualSensor }
+        applyExposureControls()
     }
 
-    private fun applyExposureBoost() {
+    fun setExposureCompensation(ev: Float) {
+        exposureCompensationEv = ev.coerceIn(
+            maxOf(-3f, exposureCapabilities.minimumCompensationEv),
+            minOf(3f, exposureCapabilities.maximumCompensationEv)
+        )
+        applyExposureControls()
+    }
+
+    fun resetExposureCompensation() = setExposureCompensation(0f)
+
+    private fun applyExposureControls() {
         val builder = previewRequestBuilder ?: return
         val session = captureSession ?: return
         try {
             applyExposureSettings(builder)
             session.setRepeatingRequest(builder.build(), null, backgroundHandler)
         } catch (e: Exception) {
-            Log.e(TAG, "Unable to apply exposure boost", e)
+            Log.e(TAG, "Unable to apply exposure controls", e)
         }
     }
 
     private fun applyExposureSettings(builder: CaptureRequest.Builder) {
-        if (!isIsoBoostEnabled && !isShutterBoostEnabled) {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-            builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
-            return
-        }
-        val capabilities = activeCharacteristics
-            ?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
-        if (!capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) {
+        val manualActive = exposureCapabilities.manualSensor &&
+            (manualIso != null || manualExposureTimeNs != null)
+        if (!manualActive) {
+            val step = exposureCapabilities.compensationStepEv.takeIf { it > 0f } ?: 1f / 3f
             val compensationRange = activeCharacteristics
                 ?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
             builder.set(
                 CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
-                ((if (isIsoBoostEnabled) 1 else 0) + (if (isShutterBoostEnabled) 1 else 0))
-                    .coerceIn(compensationRange?.lower ?: 0, compensationRange?.upper ?: 0)
+                (exposureCompensationEv / step).roundToInt().coerceIn(
+                    compensationRange?.lower ?: 0,
+                    compensationRange?.upper ?: 0
+                )
             )
             return
         }
-        val isoRange = activeCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-        val exposureRange = activeCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-        val iso = (baseAutoIso * if (isIsoBoostEnabled) 2 else 1)
-            .coerceIn(isoRange?.lower ?: 50, isoRange?.upper ?: 6400)
-        val exposure = (baseAutoExposureTimeNs * if (isShutterBoostEnabled) 2L else 1L)
-            .coerceIn(exposureRange?.lower ?: 100_000L, exposureRange?.upper ?: 1_000_000_000L)
+        val evFactor = 2.0.pow(exposureCompensationEv.toDouble())
+        var iso = manualIso ?: baseAutoIso
+        var exposure = manualExposureTimeNs ?: baseAutoExposureTimeNs
+        if (manualIso == null) {
+            iso = (iso * evFactor).roundToInt()
+        } else {
+            exposure = (exposure * evFactor).toLong()
+        }
+        iso = iso.coerceIn(exposureCapabilities.minimumIso, exposureCapabilities.maximumIso)
+        exposure = exposure.coerceIn(
+            exposureCapabilities.minimumExposureTimeNs,
+            exposureCapabilities.maximumExposureTimeNs
+        )
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+        builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
         builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
+        val maximumFrameDuration = activeCharacteristics
+            ?.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION)
+            ?: exposure
+        builder.set(
+            CaptureRequest.SENSOR_FRAME_DURATION,
+            exposure.coerceAtMost(maximumFrameDuration)
+        )
     }
 
     fun openNativeGallery(): Boolean {
         try {
-            val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-            val selection = buildString {
-                append("${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?")
-                append(" AND ${MediaStore.Images.Media.SIZE} > 0")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    append(" AND ${MediaStore.Images.Media.IS_PENDING} = 0")
-                }
-            }
-            val latest = context.contentResolver.query(
-                collection,
-                arrayOf(MediaStore.Images.Media._ID),
-                selection,
-                arrayOf("hooru_%"),
-                "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
-            )?.use { cursor ->
-                if (!cursor.moveToFirst()) null else {
-                    val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-                    ContentUris.withAppendedId(collection, cursor.getLong(idColumn))
-                }
-            } ?: return false
+            val latest = findLatestHooruImageUri() ?: return false
             val reviewIntent = Intent("com.android.camera.action.REVIEW", latest).apply {
                 setDataAndType(latest, "image/*")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -511,6 +692,50 @@ class CameraEngine(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Unable to open native gallery", e)
             return false
+        }
+    }
+
+    fun loadLatestGalleryThumbnail(sizePx: Int = 160): Bitmap? {
+        val latest = findLatestHooruImageUri() ?: return null
+        return runCatching {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, latest)) { decoder, info, _ ->
+                val sourceSize = info.size
+                val scale = minOf(
+                    sizePx.toFloat() / sourceSize.width.coerceAtLeast(1),
+                    sizePx.toFloat() / sourceSize.height.coerceAtLeast(1)
+                ).coerceAtMost(1f)
+                decoder.setTargetSize(
+                    (sourceSize.width * scale).roundToInt().coerceAtLeast(1),
+                    (sourceSize.height * scale).roundToInt().coerceAtLeast(1)
+                )
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+        }.getOrElse {
+            Log.w(TAG, "Unable to load latest gallery thumbnail", it)
+            null
+        }
+    }
+
+    private fun findLatestHooruImageUri(): Uri? {
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val selection = buildString {
+            append("${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?")
+            append(" AND ${MediaStore.Images.Media.SIZE} > 0")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                append(" AND ${MediaStore.Images.Media.IS_PENDING} = 0")
+            }
+        }
+        return context.contentResolver.query(
+            collection,
+            arrayOf(MediaStore.Images.Media._ID),
+            selection,
+            arrayOf("hooru_%"),
+            "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) null else {
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                ContentUris.withAppendedId(collection, cursor.getLong(idColumn))
+            }
         }
     }
 
@@ -534,7 +759,7 @@ class CameraEngine(private val context: Context) {
             val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(previewSurface)
 
-                disableOptionalImageProcessing(this)
+                applyImageProcessingPreference(this)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 activeCharacteristics
@@ -648,13 +873,32 @@ class CameraEngine(private val context: Context) {
             CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF
         )
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
-            chars.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+        if (chars.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
                 ?.contains(CaptureRequest.DISTORTION_CORRECTION_MODE_OFF) == true
         ) builder.set(
             CaptureRequest.DISTORTION_CORRECTION_MODE,
             CaptureRequest.DISTORTION_CORRECTION_MODE_OFF
         )
+    }
+
+    private fun applyImageProcessingPreference(builder: CaptureRequest.Builder) {
+        if (activeProcessingMode != ProcessingMode.ANDROID) {
+            disableOptionalImageProcessing(builder)
+            return
+        }
+        val chars = activeCharacteristics ?: return
+        chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+            ?.firstOrNull { it == CaptureRequest.EDGE_MODE_HIGH_QUALITY || it == CaptureRequest.EDGE_MODE_FAST }
+            ?.let { builder.set(CaptureRequest.EDGE_MODE, it) }
+        chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+            ?.firstOrNull {
+                it == CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY ||
+                    it == CaptureRequest.NOISE_REDUCTION_MODE_FAST
+            }
+            ?.let { builder.set(CaptureRequest.NOISE_REDUCTION_MODE, it) }
+        chars.get(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES)
+            ?.firstOrNull { it == CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY }
+            ?.let { builder.set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, it) }
     }
 
     private fun startPreviewRepeatingRequest() {
@@ -672,19 +916,23 @@ class CameraEngine(private val context: Context) {
 
                     currentIso = iso
                     currentExposureTimeNs = expTimeNs
-                    if (!isIsoBoostEnabled && !isShutterBoostEnabled) {
+                    if (manualIso == null && manualExposureTimeNs == null) {
                         baseAutoIso = iso
                         baseAutoExposureTimeNs = expTimeNs
                     }
                     currentShutterStr = formatExposureTime(expTimeNs)
 
-                    onTelemetryListener?.invoke(
-                        TelemetryData(
+                    mainHandler.post {
+                        onTelemetryListener?.invoke(TelemetryData(
                             iso = currentIso,
                             shutterSpeed = currentShutterStr,
-                            format = captureFormat
-                        )
-                    )
+                            exposureTimeNs = currentExposureTimeNs,
+                            format = captureFormat,
+                            exposureCompensation = exposureCompensationEv,
+                            isoManual = manualIso != null,
+                            shutterManual = manualExposureTimeNs != null
+                        ))
+                    }
                 }
             }, backgroundHandler)
         } catch (e: Exception) {
@@ -695,7 +943,7 @@ class CameraEngine(private val context: Context) {
     private fun formatExposureTime(ns: Long): String {
         val seconds = ns / 1_000_000_000.0
         return if (seconds >= 1.0) {
-            String.format("%.1fs", seconds)
+            String.format(Locale.US, "%.1fs", seconds)
         } else {
             val denominator = Math.round(1.0 / seconds)
             "1/$denominator"
@@ -706,6 +954,12 @@ class CameraEngine(private val context: Context) {
         val blackoutDuration = (currentExposureTimeNs / 1_000_000L + 45L).coerceIn(65L, 1500L)
         val device = cameraDevice ?: return blackoutDuration
         val session = captureSession ?: return blackoutDuration
+
+        // Keep the capture path safe if a camera capability changes while the
+        // preview is being recreated or the lens is being switched.
+        if (!supportsRawCapture && captureFormat != "JPG") {
+            captureFormat = "JPG"
+        }
 
         try {
             val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
@@ -725,7 +979,7 @@ class CameraEngine(private val context: Context) {
                 }
             }
 
-            disableOptionalImageProcessing(captureBuilder)
+            applyImageProcessingPreference(captureBuilder)
             captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             applyExposureSettings(captureBuilder)
             applyZoomToRequest(captureBuilder, currentZoomRatio)
@@ -733,6 +987,10 @@ class CameraEngine(private val context: Context) {
             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             val filterAtCapture = activeFilterId
             val lightroomAtCapture = activeLightroomPreset
+            val intensityAtCapture = activeLookIntensity
+            val grainAtCapture = activeLookGrain
+            val halationAtCapture = activeLookHalation
+            val aspectRatioAtCapture = captureAspectRatio
             if (isFlashEnabled) {
                 captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
             }
@@ -790,7 +1048,11 @@ class CameraEngine(private val context: Context) {
                         capturedBytes,
                         jpegOrientation,
                         filterAtCapture,
-                        lightroomAtCapture
+                        lightroomAtCapture,
+                        intensityAtCapture,
+                        grainAtCapture,
+                        halationAtCapture,
+                        aspectRatioAtCapture
                     )
                     finishJpegSave(saved)
                 }
@@ -821,11 +1083,21 @@ class CameraEngine(private val context: Context) {
         return blackoutDuration
     }
 
+    fun requestHardwareShutter() {
+        mainHandler.post {
+            onHardwareShutterListener?.invoke() ?: triggerCapture()
+        }
+    }
+
     private fun saveCapturedJpeg(
         bytes: ByteArray,
         jpegOrientation: Int,
         filterId: String,
-        lightroomPreset: LightroomPreset?
+        lightroomPreset: LightroomPreset?,
+        intensity: Float,
+        grain: Float,
+        halation: Float,
+        aspectRatio: Float
     ): Boolean {
         val displayName = "hooru_${System.currentTimeMillis()}_${System.nanoTime() % 1000}.jpg"
         var pendingUri: Uri? = null
@@ -844,7 +1116,7 @@ class CameraEngine(private val context: Context) {
                     values
                 ) ?: error("MediaStore entry could not be created")
                 context.contentResolver.openOutputStream(requireNotNull(pendingUri), "w")?.use { out ->
-                    writeCapturedJpeg(out, bytes, jpegOrientation, filterId, lightroomPreset)
+                    writeCapturedJpeg(out, bytes, jpegOrientation, filterId, lightroomPreset, intensity, grain, halation, aspectRatio)
                 } ?: error("MediaStore output stream could not be opened")
                 val published = ContentValues().apply {
                     put(MediaStore.Images.Media.IS_PENDING, 0)
@@ -858,7 +1130,7 @@ class CameraEngine(private val context: Context) {
                 pendingFile = File(directory, ".$displayName.pending")
                 publishedFile = File(directory, displayName)
                 FileOutputStream(requireNotNull(pendingFile)).use { out ->
-                    writeCapturedJpeg(out, bytes, jpegOrientation, filterId, lightroomPreset)
+                    writeCapturedJpeg(out, bytes, jpegOrientation, filterId, lightroomPreset, intensity, grain, halation, aspectRatio)
                 }
                 check(requireNotNull(pendingFile).renameTo(requireNotNull(publishedFile))) {
                     "Completed JPEG could not be published"
@@ -887,13 +1159,19 @@ class CameraEngine(private val context: Context) {
         bytes: ByteArray,
         jpegOrientation: Int,
         filterId: String,
-        lightroomPreset: LightroomPreset?
+        lightroomPreset: LightroomPreset?,
+        intensity: Float,
+        grain: Float,
+        halation: Float,
+        aspectRatio: Float
     ) {
         var working: Bitmap? = null
         var filtered: Bitmap? = null
+        var finished: Bitmap? = null
         try {
             val colorMatrix = createPresetColorMatrix(filterId)
-            if (colorMatrix == null && lightroomPreset == null) {
+            val needsCrop = kotlin.math.abs(aspectRatio - 3f / 4f) > .001f
+            if (colorMatrix == null && lightroomPreset == null && grain <= 0f && halation <= 0f && !needsCrop) {
                 output.write(bytes)
             } else {
                 working = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
@@ -907,9 +1185,14 @@ class CameraEngine(private val context: Context) {
                     source.recycle()
                     working = oriented
                 }
+                val cropped = centerCropToAspect(requireNotNull(working), aspectRatio)
+                if (cropped !== working) {
+                    working?.recycle()
+                    working = cropped
+                }
                 filtered = if (lightroomPreset != null) {
                     lightroomPreset.applyToBitmap(requireNotNull(working))
-                } else Bitmap.createBitmap(
+                } else if (colorMatrix != null) Bitmap.createBitmap(
                     requireNotNull(working).width,
                     requireNotNull(working).height,
                     Bitmap.Config.ARGB_8888
@@ -917,15 +1200,88 @@ class CameraEngine(private val context: Context) {
                     Canvas(result).drawBitmap(requireNotNull(working), 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         colorFilter = ColorMatrixColorFilter(requireNotNull(colorMatrix))
                     })
-                }
-                check(requireNotNull(filtered).compress(Bitmap.CompressFormat.JPEG, 95, output)) {
+                } else requireNotNull(working)
+                finished = finishLook(
+                    source = requireNotNull(working),
+                    filtered = requireNotNull(filtered),
+                    intensity = intensity,
+                    grain = grain,
+                    halation = halation
+                )
+                check(requireNotNull(finished).compress(Bitmap.CompressFormat.JPEG, 95, output)) {
                     "JPEG encoder failed"
                 }
             }
         } finally {
+            finished?.takeIf { it !== filtered && it !== working && !it.isRecycled }?.recycle()
             filtered?.takeIf { it !== working && !it.isRecycled }?.recycle()
             working?.takeIf { !it.isRecycled }?.recycle()
         }
+    }
+
+    private fun centerCropToAspect(source: Bitmap, targetWidthOverHeight: Float): Bitmap {
+        val target = targetWidthOverHeight.coerceIn(9f / 21f, 1f)
+        val current = source.width.toFloat() / source.height
+        if (kotlin.math.abs(current - target) < .002f) return source
+        return if (current > target) {
+            val width = (source.height * target).roundToInt().coerceAtMost(source.width)
+            Bitmap.createBitmap(source, (source.width - width) / 2, 0, width, source.height)
+        } else {
+            val height = (source.width / target).roundToInt().coerceAtMost(source.height)
+            Bitmap.createBitmap(source, 0, (source.height - height) / 2, source.width, height)
+        }
+    }
+
+    private fun finishLook(
+        source: Bitmap,
+        filtered: Bitmap,
+        intensity: Float,
+        grain: Float,
+        halation: Float
+    ): Bitmap {
+        val mix = intensity.coerceIn(0f, 1f)
+        if (mix >= .999f && grain <= 0f && halation <= 0f) return filtered
+        val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+        Canvas(output).apply {
+            drawBitmap(source, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG))
+            drawBitmap(filtered, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                alpha = (mix * 255f).roundToInt()
+            })
+        }
+        if (grain <= 0f && halation <= 0f) return output
+        val pixels = IntArray(output.width * output.height)
+        output.getPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+        val grainStrength = grain.coerceIn(0f, 1f) * 22f
+        val halationStrength = halation.coerceIn(0f, 1f) * .24f
+        for (index in pixels.indices) {
+            val color = pixels[index]
+            var red = android.graphics.Color.red(color).toFloat()
+            var green = android.graphics.Color.green(color).toFloat()
+            var blue = android.graphics.Color.blue(color).toFloat()
+            if (halationStrength > 0f) {
+                val luma = (.2126f * red + .7152f * green + .0722f * blue) / 255f
+                val highlight = ((luma - .72f) / .28f).coerceIn(0f, 1f) * halationStrength
+                red += 255f * highlight
+                green += 72f * highlight
+                blue -= 32f * highlight
+            }
+            if (grainStrength > 0f) {
+                var hash = index * 374761393 + 668265263
+                hash = (hash xor (hash ushr 13)) * 1274126177
+                val noise = ((hash and 0xffff) / 32767.5f - 1f) * grainStrength
+                red += noise
+                green += noise
+                blue += noise
+            }
+            pixels[index] = android.graphics.Color.argb(
+                android.graphics.Color.alpha(color),
+                red.roundToInt().coerceIn(0, 255),
+                green.roundToInt().coerceIn(0, 255),
+                blue.roundToInt().coerceIn(0, 255)
+            )
+        }
+        output.setPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+        return output
     }
 
     private fun beginJpegSave() {

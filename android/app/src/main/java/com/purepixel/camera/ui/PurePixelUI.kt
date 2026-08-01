@@ -3,6 +3,10 @@ package com.purepixel.camera.ui
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.view.HapticFeedbackConstants
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
@@ -20,6 +24,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,6 +36,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -56,6 +62,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.colorspace.ColorSpaces
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -75,21 +82,27 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.purepixel.camera.camera.CameraEngine
 import com.purepixel.camera.gl.CameraPreviewGL
 import com.purepixel.camera.gl.GLCameraView
+import com.purepixel.camera.gl.PreviewAnalysis
 import com.purepixel.camera.model.Preset
 import com.purepixel.camera.model.LightroomPreset
 import com.purepixel.camera.model.FilterPreviewCache
 import com.purepixel.camera.model.FilterPreview
 import com.purepixel.camera.model.PresetLibrary
+import com.purepixel.camera.model.ProcessingMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 enum class UiStateMode {
@@ -98,20 +111,46 @@ enum class UiStateMode {
     FILTER_ACTIVE  // Image 2: Swipe on shutter opens Filter Carousel, auto-fades back after 2s
 }
 
-private fun buildShutterPresets(custom: List<Preset>, selectedIds: Set<String>): List<Preset> {
-    val builtIns = Preset.DEFAULT_PRESETS.filterNot(Preset::isAddButton)
-    val selected = (builtIns + custom).filter { it.id == "no_filter" || it.id in selectedIds }
-    return selected + Preset.DEFAULT_PRESETS.first(Preset::isAddButton)
+private fun buildShutterPresets(
+    builtIns: List<Preset>,
+    custom: List<Preset>,
+    selectedIds: Set<String>
+): List<Preset> {
+    val selectableBuiltIns = builtIns.filterNot(Preset::isAddButton)
+    val selected = (selectableBuiltIns + custom).filter { it.id == "no_filter" || it.id in selectedIds }
+    return selected + builtIns.first(Preset::isAddButton)
 }
 
-private fun filterCode(preset: Preset): String {
-    val aliases = mapOf(
-        "leica_mono" to "LEIC", "teal_orange" to "TEAL", "no_filter" to "NONE",
-        "portra_400" to "PORT", "classic_chrome" to "FUJI", "warm_fade" to "WARM",
-        "cool_night" to "COOL", "high_contrast" to "HIGH", "cinema_green" to "CINE",
-        "soft_rose" to "ROSE"
-    )
-    return aliases[preset.id] ?: preset.name.uppercase().filter(Char::isLetterOrDigit).padEnd(4, '·').take(4)
+private fun formatExposureTime(ns: Long): String {
+    val seconds = ns / 1_000_000_000.0
+    return if (seconds >= 1.0) {
+        if (seconds >= 10) "${seconds.roundToInt()}s" else String.format(Locale.US, "%.1fs", seconds)
+    } else {
+        "1/${(1.0 / seconds).roundToInt()}"
+    }
+}
+
+private fun isoStops(capabilities: CameraEngine.ExposureCapabilities): List<Int> = listOf(
+    25, 32, 40, 50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800,
+    1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800
+).filter { it in capabilities.minimumIso..capabilities.maximumIso }
+    .ifEmpty { listOf(capabilities.minimumIso, capabilities.maximumIso).distinct() }
+
+private fun shutterStops(capabilities: CameraEngine.ExposureCapabilities): List<Long> = listOf(
+    125_000L, 250_000L, 500_000L, 1_000_000L, 2_000_000L, 4_000_000L,
+    8_000_000L, 16_666_667L, 33_333_333L, 66_666_667L, 125_000_000L,
+    250_000_000L, 500_000_000L, 1_000_000_000L, 2_000_000_000L,
+    4_000_000_000L, 8_000_000_000L, 15_000_000_000L, 30_000_000_000L
+).filter { it in capabilities.minimumExposureTimeNs..capabilities.maximumExposureTimeNs }
+    .ifEmpty { listOf(capabilities.minimumExposureTimeNs, capabilities.maximumExposureTimeNs).distinct() }
+
+private fun formatFocalLength(millimeters: Float): String {
+    val rounded = millimeters.roundToInt()
+    return if (abs(millimeters - rounded) < 0.05f) {
+        "${rounded}mm"
+    } else {
+        String.format(Locale.US, "%.1fmm", millimeters)
+    }
 }
 
 private fun hdrBoost(color: Color, multiplier: Float = 1.28f): Color = Color(
@@ -158,14 +197,20 @@ fun PurePixelScreen(
     val scope = rememberCoroutineScope()
     val presetLibrary = remember { PresetLibrary(context.applicationContext) }
     val previewCache = remember { FilterPreviewCache(context.applicationContext) }
+    val cameraSettings = remember {
+        context.applicationContext.getSharedPreferences("camera_settings", android.content.Context.MODE_PRIVATE)
+    }
     val snackbarHostState = remember { SnackbarHostState() }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var telemetry by remember { mutableStateOf(CameraEngine.TelemetryData()) }
+    var exposureCapabilities by remember { mutableStateOf(cameraEngine.exposureCapabilities) }
+    var rawCaptureSupported by remember { mutableStateOf(cameraEngine.supportsRawCapture) }
     var glView by remember { mutableStateOf<GLCameraView?>(null) }
     var backgroundFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var flashEnabled by remember { mutableStateOf(false) }
-    var isoBoostEnabled by remember { mutableStateOf(false) }
-    var shutterBoostEnabled by remember { mutableStateOf(false) }
+    var manualIso by remember { mutableStateOf<Int?>(null) }
+    var manualShutterNs by remember { mutableStateOf<Long?>(null) }
+    var exposureCompensation by remember { mutableFloatStateOf(0f) }
     var previewBlackout by remember { mutableStateOf(false) }
     var blackoutDurationMs by remember { mutableLongStateOf(80L) }
     var shutterSequence by remember { mutableIntStateOf(0) }
@@ -173,29 +218,57 @@ fun PurePixelScreen(
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var focusSequence by remember { mutableIntStateOf(0) }
 
+    var builtInPresets by remember { mutableStateOf(presetLibrary.builtInPresets()) }
     var customPresets by remember { mutableStateOf(presetLibrary.customPresets()) }
+    var rememberLastFilter by remember {
+        mutableStateOf(cameraSettings.getBoolean("remember_last_filter", false))
+    }
     val defaultSelectedIds = remember {
-        Preset.DEFAULT_PRESETS.filterNot(Preset::isAddButton).map(Preset::id).toSet()
+        builtInPresets.filterNot(Preset::isAddButton).map(Preset::id).toSet()
     }
     var selectedPresetIds by remember {
         mutableStateOf(presetLibrary.selectedIds(defaultSelectedIds))
     }
     var presets by remember {
-        mutableStateOf(buildShutterPresets(customPresets, selectedPresetIds))
+        mutableStateOf(buildShutterPresets(builtInPresets, customPresets, selectedPresetIds))
     }
     var activePresetIndex by remember {
-        mutableIntStateOf(presets.indexOfFirst { it.id == "no_filter" }.coerceAtLeast(0))
+        val initialPresetId = if (cameraSettings.getBoolean("remember_last_filter", false)) {
+            cameraSettings.getString("last_filter_id", "no_filter") ?: "no_filter"
+        } else {
+            "no_filter"
+        }
+        mutableIntStateOf(
+            presets.indexOfFirst { it.id == initialPresetId }
+                .takeIf { it >= 0 }
+                ?: presets.indexOfFirst { it.id == "no_filter" }.coerceAtLeast(0)
+        )
     }
     var pendingPresetIndex by remember { mutableIntStateOf(activePresetIndex) }
     var uiMode by remember { mutableStateOf(UiStateMode.IDLE) }
     var showPresetSheet by remember { mutableStateOf(false) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
+    var editingPreset by remember { mutableStateOf<Preset?>(null) }
     var isImportingPreset by remember { mutableStateOf(false) }
     var recentRevision by remember { mutableIntStateOf(0) }
     var gallerySaveState by remember { mutableStateOf(CameraEngine.GallerySaveState()) }
     val galleryArrivalScale = remember { Animatable(1f) }
     var showGalleryArrival by remember { mutableStateOf(false) }
+    var galleryThumbnail by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var previewAnalysis by remember { mutableStateOf(PreviewAnalysis()) }
+    var analysisEnabled by remember { mutableStateOf(cameraSettings.getBoolean("analysis_enabled", false)) }
+    var zebraMode by remember { mutableIntStateOf(cameraSettings.getInt("zebra_mode", 0)) }
+    var focusPeakingEnabled by remember { mutableStateOf(cameraSettings.getBoolean("focus_peaking", false)) }
+    var selectedAspectRatio by remember { mutableFloatStateOf(cameraSettings.getFloat("aspect_ratio", 3f / 4f)) }
+    var gridEnabled by remember { mutableStateOf(cameraSettings.getBoolean("grid", false)) }
+    var levelEnabled by remember { mutableStateOf(cameraSettings.getBoolean("level", false)) }
+    var timerSeconds by remember { mutableIntStateOf(cameraSettings.getInt("timer_seconds", 0)) }
+    var countdown by remember { mutableIntStateOf(0) }
+    var deviceRoll by remember { mutableFloatStateOf(0f) }
     
-    // Zoom ratio (0.5x to 8.0x)
+    // The camera engine supplies the active phone camera's focal lengths as labels
+    // for the full zoom scale; it does not define the scale itself.
+    var availableFocalLengths by remember { mutableStateOf(cameraEngine.availableFocalLengths) }
     var currentZoom by remember { mutableFloatStateOf(1.3f) }
     val smoothedZoom by animateFloatAsState(
         targetValue = currentZoom,
@@ -210,47 +283,98 @@ fun PurePixelScreen(
     var filterInteractionCounter by remember { mutableIntStateOf(0) }
     var zoomInteractionCounter by remember { mutableIntStateOf(0) }
 
-    // Native XMP import. Parsing, LUT generation and card rendering stay off the UI thread.
+    // Native multi-XMP import. Parsing, LUT generation and card rendering stay off the UI thread.
     val lutPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri> ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
         scope.launch {
             isImportingPreset = true
             val progressSnackbar = launch {
                 snackbarHostState.showSnackbar(
-                    message = "Lightroom-Filter wird importiert und konvertiert …",
+                    message = if (uris.size == 1) {
+                        "Lightroom-Preset wird importiert und konvertiert …"
+                    } else {
+                        "${uris.size} Lightroom-Presets werden importiert und konvertiert …"
+                    },
                     duration = SnackbarDuration.Indefinite
                 )
             }
-            val importResult = runCatching {
-                val displayName = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) cursor.getString(0) else null
-                } ?: "Lightroom"
-                val imported = withContext(Dispatchers.IO) {
-                    val text = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                        ?: error("Die Datei konnte nicht gelesen werden.")
-                    presetLibrary.importXmp(text, displayName.substringBeforeLast('.'))
+            val importedPresets = mutableListOf<Preset>()
+            val failures = mutableListOf<Throwable>()
+            try {
+                uris.forEach { uri ->
+                    runCatching {
+                        val imported = withContext(Dispatchers.IO) {
+                            val displayName = context.contentResolver.query(
+                                uri,
+                                arrayOf(OpenableColumns.DISPLAY_NAME),
+                                null,
+                                null,
+                                null
+                            )?.use { cursor ->
+                                if (cursor.moveToFirst()) cursor.getString(0) else null
+                            } ?: "Lightroom"
+                            val text = context.contentResolver.openInputStream(uri)
+                                ?.bufferedReader()
+                                ?.use { it.readText() }
+                                ?: error("${displayName}: Datei konnte nicht gelesen werden.")
+                            presetLibrary.importXmp(text, displayName.substringBeforeLast('.'))
+                        }
+                        // Finish every conversion before publishing the updated library.
+                        previewCache.preview(imported)
+                        imported
+                    }.onSuccess(importedPresets::add)
+                        .onFailure(failures::add)
                 }
-                // Finish conversion before announcing success, so the card appears immediately.
-                previewCache.preview(imported)
-                val updatedCustom = presetLibrary.customPresets()
-                val nextIds = selectedPresetIds + imported.id
-                customPresets = updatedCustom
-                selectedPresetIds = nextIds
-                presetLibrary.saveSelected(nextIds)
-                presets = buildShutterPresets(updatedCustom, nextIds)
-                recentRevision++
+                if (importedPresets.isNotEmpty()) {
+                    val updatedCustom = presetLibrary.customPresets()
+                    val nextIds = selectedPresetIds + importedPresets.map(Preset::id)
+                    customPresets = updatedCustom
+                    selectedPresetIds = nextIds
+                    presetLibrary.saveSelected(nextIds)
+                    presets = buildShutterPresets(builtInPresets, updatedCustom, nextIds)
+                    recentRevision++
+                }
+            } finally {
+                snackbarHostState.currentSnackbarData?.dismiss()
+                progressSnackbar.cancel()
+                isImportingPreset = false
             }
-            snackbarHostState.currentSnackbarData?.dismiss()
-            progressSnackbar.cancel()
-            isImportingPreset = false
-            importResult.fold(
-                onSuccess = { snackbarHostState.showSnackbar("Filter importiert und zur Kamera-Leiste hinzugefügt.") },
-                onFailure = { error -> snackbarHostState.showSnackbar(error.message ?: "Preset konnte nicht importiert werden.") }
-            )
+            val importedCount = importedPresets.map(Preset::id).distinct().size
+            val resultMessage = when {
+                failures.isEmpty() && importedCount == 1 ->
+                    "Preset importiert, konvertiert und zur Kamera-Leiste hinzugefügt."
+                failures.isEmpty() ->
+                    "$importedCount Presets importiert, konvertiert und zur Kamera-Leiste hinzugefügt."
+                importedCount == 0 ->
+                    failures.firstOrNull()?.message ?: "Die Presets konnten nicht importiert werden."
+                else ->
+                    "$importedCount Presets importiert, ${failures.size} konnten nicht verarbeitet werden."
+            }
+            snackbarHostState.showSnackbar(resultMessage)
         }
     }
+
+    val capturePhoto: () -> Unit = {
+        if (countdown == 0) {
+            scope.launch {
+                shutterPressed = false
+                if (timerSeconds > 0) {
+                    for (remaining in timerSeconds downTo 1) {
+                        countdown = remaining
+                        hostView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        delay(1000L)
+                    }
+                    countdown = 0
+                }
+                blackoutDurationMs = cameraEngine.triggerCapture()
+                shutterSequence++
+                hostView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            }
+        }
+    }
+    val latestCapturePhoto by rememberUpdatedState(capturePhoto)
 
     // 2.5-Second Inactivity Timer for Zoom Rocker -> Fades back to IDLE state
     LaunchedEffect(uiMode, currentZoom, zoomInteractionCounter) {
@@ -277,6 +401,9 @@ fun PurePixelScreen(
 
     LaunchedEffect(gallerySaveState.savedRevision) {
         if (gallerySaveState.savedRevision > 0) {
+            galleryThumbnail = withContext(Dispatchers.IO) {
+                cameraEngine.loadLatestGalleryThumbnail()
+            }?.asImageBitmap()
             showGalleryArrival = true
             galleryArrivalScale.snapTo(.86f)
             galleryArrivalScale.animateTo(1.16f, tween(durationMillis = 170))
@@ -289,6 +416,13 @@ fun PurePixelScreen(
         }
     }
 
+
+    LaunchedEffect(Unit) {
+        galleryThumbnail = withContext(Dispatchers.IO) {
+            cameraEngine.loadLatestGalleryThumbnail()
+        }?.asImageBitmap()
+    }
+
     LaunchedEffect(gallerySaveState.failedRevision) {
         if (gallerySaveState.failedRevision > 0) {
             snackbarHostState.showSnackbar("Das Foto konnte nicht in der Galerie gespeichert werden.")
@@ -299,19 +433,59 @@ fun PurePixelScreen(
         cameraEngine.setZoomRatio(smoothedZoom)
     }
 
-    // Listen to real-time camera telemetry
+    // Listen to real-time camera telemetry and the active camera's physical lenses.
     DisposableEffect(Unit) {
+        rawCaptureSupported = cameraEngine.supportsRawCapture
+        cameraEngine.onRawCapabilityListener = { supported ->
+            rawCaptureSupported = supported
+        }
         cameraEngine.onTelemetryListener = { data ->
             telemetry = data
         }
+        availableFocalLengths = cameraEngine.availableFocalLengths
+        cameraEngine.onFocalLengthsListener = { options ->
+            availableFocalLengths = options
+        }
+        exposureCapabilities = cameraEngine.exposureCapabilities
+        cameraEngine.onExposureCapabilitiesListener = { capabilities ->
+            exposureCapabilities = capabilities
+            if (!capabilities.manualSensor) {
+                manualIso = null
+                manualShutterNs = null
+            }
+        }
+        cameraEngine.onHardwareShutterListener = { latestCapturePhoto() }
         cameraEngine.onGallerySaveStateListener = { state ->
             gallerySaveState = state
         }
         onDispose {
             cameraEngine.onTelemetryListener = null
+            cameraEngine.onRawCapabilityListener = null
+            cameraEngine.onFocalLengthsListener = null
+            cameraEngine.onExposureCapabilitiesListener = null
+            cameraEngine.onHardwareShutterListener = null
             cameraEngine.onPreviewConfigurationListener = null
             cameraEngine.onGallerySaveStateListener = null
         }
+    }
+
+    DisposableEffect(levelEnabled) {
+        if (!levelEnabled) return@DisposableEffect onDispose { }
+        val sensorManager = context.getSystemService(SensorManager::class.java)
+        val rotationSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                val measuredRoll = Math.toDegrees(
+                    kotlin.math.atan2(-event.values[0].toDouble(), event.values[1].toDouble())
+                ).toFloat()
+                deviceRoll = deviceRoll * .82f + measuredRoll * .18f
+            }
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+        }
+        if (rotationSensor != null) {
+            sensorManager.registerListener(listener, rotationSensor, SensorManager.SENSOR_DELAY_UI)
+        }
+        onDispose { sensorManager?.unregisterListener(listener) }
     }
 
     val activePreset = presets.getOrElse(activePresetIndex) { presets[0] }
@@ -320,11 +494,65 @@ fun PurePixelScreen(
     val latestActivePresetIndex by rememberUpdatedState(activePresetIndex)
     val latestGlView by rememberUpdatedState(glView)
     val latestCurrentZoom by rememberUpdatedState(currentZoom)
-    val zoomMilestones = remember { listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f) }
+    val isoOptions = remember(exposureCapabilities) { isoStops(exposureCapabilities) }
+    val shutterOptions = remember(exposureCapabilities) { shutterStops(exposureCapabilities) }
+    val evOptions = remember { (-9..9).map { it / 3f } }
 
-    LaunchedEffect(activePreset.id, activePreset.lightroom, glView) {
+    LaunchedEffect(
+        activePreset.id,
+        activePreset.lightroom,
+        activePreset.intensity,
+        activePreset.grain,
+        activePreset.halation,
+        glView
+    ) {
         applyPresetToPreview(glView, activePreset)
-        cameraEngine.setCaptureFilter(activePreset.id, activePreset.lightroom)
+        cameraEngine.setCaptureFilter(activePreset)
+    }
+
+    LaunchedEffect(activePreset.id, rememberLastFilter) {
+        cameraSettings.edit().apply {
+            putBoolean("remember_last_filter", rememberLastFilter)
+            if (rememberLastFilter) {
+                putString("last_filter_id", activePreset.id)
+            } else {
+                remove("last_filter_id")
+            }
+        }.apply()
+    }
+
+
+    LaunchedEffect(glView, zebraMode, focusPeakingEnabled) {
+        glView?.setAssistSettings(zebraMode, focusPeakingEnabled)
+    }
+
+    LaunchedEffect(glView, analysisEnabled) {
+        glView?.setAnalysisEnabled(analysisEnabled)
+        if (!analysisEnabled) previewAnalysis = PreviewAnalysis()
+    }
+
+    LaunchedEffect(selectedAspectRatio) {
+        cameraEngine.captureAspectRatio = selectedAspectRatio
+    }
+
+    LaunchedEffect(
+        zebraMode,
+        focusPeakingEnabled,
+        selectedAspectRatio,
+        gridEnabled,
+        levelEnabled,
+        timerSeconds,
+        analysisEnabled
+    ) {
+        cameraSettings.edit()
+            .putInt("zebra_mode", zebraMode)
+            .putBoolean("focus_peaking", focusPeakingEnabled)
+            .putFloat("aspect_ratio", selectedAspectRatio)
+            .putBoolean("grid", gridEnabled)
+            .putBoolean("level", levelEnabled)
+            .putInt("timer_seconds", timerSeconds)
+            .putBoolean("analysis_enabled", analysisEnabled)
+            .apply()
     }
 
     LaunchedEffect(showPresetSheet) {
@@ -353,11 +581,39 @@ fun PurePixelScreen(
                 .windowInsetsPadding(WindowInsets.safeDrawing),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            Spacer(modifier = Modifier.height(8.dp))
+            CameraAnalysisControlBar(
+                analysis = previewAnalysis,
+                analysisEnabled = analysisEnabled,
+                shutterOptions = shutterOptions,
+                selectedShutter = manualShutterNs ?: telemetry.exposureTimeNs,
+                shutterManual = manualShutterNs != null,
+                manualExposureSupported = exposureCapabilities.manualSensor,
+                onShutterSelected = { value ->
+                    manualShutterNs = value
+                    cameraEngine.setManualExposureTime(value)
+                },
+                onShutterReset = {
+                    manualShutterNs = null
+                    cameraEngine.setManualExposureTime(null)
+                },
+                evOptions = evOptions,
+                selectedEv = exposureCompensation,
+                evManual = abs(exposureCompensation) > .01f,
+                onEvSelected = { value ->
+                    exposureCompensation = value
+                    cameraEngine.setExposureCompensation(value)
+                },
+                onEvReset = {
+                    exposureCompensation = 0f
+                    cameraEngine.resetExposureCompensation()
+                }
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             // 1. FIXED LIVE PREVIEW (Centered 4:3 with Outer Padding & Rounded Corners - NEVER MOVES)
             Box(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 16.dp, start = 10.dp, end = 10.dp)
+                    .fillMaxWidth(.94f)
                     .aspectRatio(3f / 4f)
                     .clip(RoundedCornerShape(28.dp))
                     .background(Color.Black)
@@ -365,8 +621,6 @@ fun PurePixelScreen(
                         detectTapGestures(
                             onTap = { position ->
                                 if (size.width > 0 && size.height > 0) {
-                                    isoBoostEnabled = false
-                                    shutterBoostEnabled = false
                                     cameraEngine.meterAndFocus(
                                         position.x / size.width,
                                         position.y / size.height
@@ -378,6 +632,9 @@ fun PurePixelScreen(
                             },
                             onDoubleTap = {
                                 flashEnabled = false
+                                manualIso = null
+                                manualShutterNs = null
+                                exposureCompensation = 0f
                                 cameraEngine.toggleCamera()
                             }
                         )
@@ -407,11 +664,18 @@ fun PurePixelScreen(
                     onPreviewReady = { view ->
                         glView = view
                         applyPresetToPreview(view, activePreset)
-                        cameraEngine.setCaptureFilter(activePreset.id, activePreset.lightroom)
+                        cameraEngine.setCaptureFilter(activePreset)
                     },
                     onPreviewFrame = { bitmap ->
                         backgroundFrame = bitmap.asImageBitmap()
-                    }
+                    },
+                    onPreviewAnalysis = { previewAnalysis = it }
+                )
+                CameraGuidesOverlay(
+                    selectedAspectRatio = selectedAspectRatio,
+                    gridEnabled = gridEnabled,
+                    levelEnabled = levelEnabled,
+                    deviceRoll = deviceRoll
                 )
                 focusPoint?.let { point ->
                     Canvas(modifier = Modifier.matchParentSize()) {
@@ -434,6 +698,22 @@ fun PurePixelScreen(
                             .matchParentSize()
                             .background(Color.Black)
                     )
+                }
+                if (countdown > 0) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .background(Color.Black.copy(alpha = .2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            countdown.toString(),
+                            color = Color.White,
+                            fontSize = 76.sp,
+                            fontWeight = FontWeight.Light,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
                 }
             }
 
@@ -465,10 +745,7 @@ fun PurePixelScreen(
                             } ?: false
 
                             if (releasedBeforeHold) {
-                                shutterPressed = false
-                                blackoutDurationMs = cameraEngine.triggerCapture()
-                                shutterSequence++
-                                hostView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                capturePhoto()
                                 return@awaitEachGesture
                             }
 
@@ -502,7 +779,7 @@ fun PurePixelScreen(
                                 } else {
                                     activePresetIndex = pendingPresetIndex
                                     applyPresetToPreview(latestGlView, selected)
-                                    cameraEngine.setCaptureFilter(selected.id, selected.lightroom)
+                                    cameraEngine.setCaptureFilter(selected)
                                     presetLibrary.markRecent(selected.id)
                                     recentRevision++
                                 }
@@ -530,7 +807,7 @@ fun PurePixelScreen(
                                 activePresetIndex = index
                                 filterInteractionCounter++
                                 applyPresetToPreview(glView, selected)
-                                cameraEngine.setCaptureFilter(selected.id, selected.lightroom)
+                                cameraEngine.setCaptureFilter(selected)
                                 presetLibrary.markRecent(selected.id)
                                 recentRevision++
                             }
@@ -546,23 +823,31 @@ fun PurePixelScreen(
                         shutterPressed = shutterPressed,
                         accentColor = accentColor,
                         captureFormat = cameraEngine.captureFormat,
+                        rawCaptureSupported = rawCaptureSupported,
                         onFormatToggle = {
-                            val nextFormat = when (cameraEngine.captureFormat) {
-                                "JPG" -> "RAW"
-                                "RAW" -> "RAW+JPG"
-                                else -> "JPG"
+                            if (rawCaptureSupported) {
+                                val nextFormat = when (cameraEngine.captureFormat) {
+                                    "JPG" -> "RAW"
+                                    "RAW" -> "RAW+JPG"
+                                    else -> "JPG"
+                                }
+                                cameraEngine.captureFormat = nextFormat
+                                telemetry = telemetry.copy(format = nextFormat)
                             }
-                            cameraEngine.captureFormat = nextFormat
-                            telemetry = telemetry.copy(format = nextFormat)
                         },
-                        isoBoostEnabled = isoBoostEnabled,
-                        shutterBoostEnabled = shutterBoostEnabled,
-                        onIsoBoostToggle = {
-                            isoBoostEnabled = cameraEngine.toggleIsoBoost()
+                        isoOptions = isoOptions,
+                        selectedIso = manualIso ?: telemetry.iso,
+                        isoManual = manualIso != null,
+                        manualIsoSupported = exposureCapabilities.manualSensor,
+                        onIsoSelected = { value ->
+                            manualIso = value
+                            cameraEngine.setManualIso(value)
                         },
-                        onShutterBoostToggle = {
-                            shutterBoostEnabled = cameraEngine.toggleShutterBoost()
+                        onIsoReset = {
+                            manualIso = null
+                            cameraEngine.setManualIso(null)
                         },
+                        onSettingsClick = { showSettingsSheet = true },
                         onShutterClick = {
                             // Stable parent handles press, hold and release.
                         },
@@ -573,7 +858,7 @@ fun PurePixelScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             // 3. BOTTOM SECTION: ZOOM ROCKER
             Box(
@@ -596,7 +881,7 @@ fun PurePixelScreen(
                                 rockerMotion = dragAmount.coerceIn(-28f, 28f)
                                 continuousZoom = (continuousZoom - dragAmount * 0.0125f)
                                     .coerceIn(0.5f, 8.0f)
-                                val nearestMilestone = zoomMilestones.minByOrNull {
+                                val nearestMilestone = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f).minByOrNull {
                                     abs(it - continuousZoom)
                                 }
                                 val stepped = if (
@@ -611,13 +896,13 @@ fun PurePixelScreen(
                                     lastZoomStep = step
                                     currentZoom = stepped
                                     zoomInteractionCounter++
-                                    val isMilestone = zoomMilestones.any { abs(it - stepped) < 0.01f }
-                                    val feedback = if (isMilestone) {
-                                        HapticFeedbackConstants.CONTEXT_CLICK
-                                    } else {
-                                        HapticFeedbackConstants.CLOCK_TICK
+                                    val isMilestone = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f).any {
+                                        abs(it - stepped) < 0.01f
                                     }
-                                    hostView.performHapticFeedback(feedback)
+                                    hostView.performHapticFeedback(
+                                        if (isMilestone) HapticFeedbackConstants.CONTEXT_CLICK
+                                        else HapticFeedbackConstants.CLOCK_TICK
+                                    )
                                 }
                             }
                         )
@@ -638,7 +923,7 @@ fun PurePixelScreen(
                     if (expanded) {
                         GaussianZoomRocker(
                             currentZoom = smoothedZoom,
-                            onZoomChange = { },
+                            focalLengths = availableFocalLengths,
                             motionVelocity = rockerMotion
                         )
                     } else {
@@ -678,7 +963,7 @@ fun PurePixelScreen(
                             scaleX = galleryArrivalScale.value
                             scaleY = galleryArrivalScale.value
                         }
-                        .clip(CircleShape)
+                        .clip(RoundedCornerShape(11.dp))
                         .springClickable(feedback = HapticFeedbackConstants.CONTEXT_CLICK) {
                             if (gallerySaveState.pendingCount > 0) {
                                 scope.launch {
@@ -694,12 +979,21 @@ fun PurePixelScreen(
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
+                    galleryThumbnail?.let { thumbnail ->
+                        Image(
+                            bitmap = thumbnail,
+                            contentDescription = "Zuletzt aufgenommenes Foto",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .matchParentSize()
+                                .padding(3.dp)
+                                .clip(RoundedCornerShape(9.dp))
+                        )
+                    } ?: Text(
                         text = "▣",
-                        color = if (showGalleryArrival) accentColor else Color.White.copy(alpha = 0.75f),
+                        color = Color.White.copy(alpha = 0.75f),
                         fontSize = 20.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 2.dp)
+                        textAlign = TextAlign.Center
                     )
                     if (gallerySaveState.pendingCount > 0) {
                         CircularProgressIndicator(
@@ -734,7 +1028,7 @@ fun PurePixelScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(8.dp))
         }
 
         SnackbarHost(
@@ -764,8 +1058,8 @@ fun PurePixelScreen(
     }
 
     if (showPresetSheet) {
-        val allLibraryPresets = Preset.DEFAULT_PRESETS.filterNot(Preset::isAddButton) + customPresets
-        val recentPresets = remember(customPresets, recentRevision) {
+        val allLibraryPresets = builtInPresets.filterNot(Preset::isAddButton) + customPresets
+        val recentPresets = remember(builtInPresets, customPresets, recentRevision) {
             presetLibrary.recentPresets(allLibraryPresets)
         }
         ModalBottomSheet(
@@ -794,12 +1088,12 @@ fun PurePixelScreen(
                     selectedPresetIds = nextIds
                     presetLibrary.saveSelected(nextIds)
                     val activeId = presets.getOrNull(activePresetIndex)?.id
-                    presets = buildShutterPresets(customPresets, nextIds)
+                    presets = buildShutterPresets(builtInPresets, customPresets, nextIds)
                     if (activeId == preset.id && wasSelected) {
                         activePresetIndex = presets.indexOfFirst { it.id == "no_filter" }.coerceAtLeast(0)
                         pendingPresetIndex = activePresetIndex
                         glView?.clearPreset()
-                        cameraEngine.setCaptureFilter("no_filter", null)
+                        cameraEngine.setCaptureFilter(presets[activePresetIndex])
                     } else {
                         activePresetIndex = presets.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
                         pendingPresetIndex = activePresetIndex
@@ -812,9 +1106,82 @@ fun PurePixelScreen(
                         showPresetSheet = false
                         lutPickerLauncher.launch(arrayOf("*/*"))
                     }
-                }
+                },
+                onEdit = { preset -> editingPreset = preset }
             )
         }
+    }
+
+    if (showSettingsSheet) {
+        Dialog(
+            onDismissRequest = { showSettingsSheet = false },
+            properties = DialogProperties(
+                usePlatformDefaultWidth = false,
+                decorFitsSystemWindows = false
+            )
+        ) {
+            Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF101010), contentColor = Color.White) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.safeDrawing)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = { showSettingsSheet = false }) {
+                            Text("‹", fontSize = 34.sp, fontWeight = FontWeight.Light)
+                        }
+                        Text(
+                            "Kamera-Einstellungen",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    HorizontalDivider(color = Color.White.copy(alpha = .08f))
+                    CameraSettingsSheet(
+                        zebraMode = zebraMode,
+                        onZebraModeChange = { zebraMode = it },
+                        focusPeakingEnabled = focusPeakingEnabled,
+                        onFocusPeakingChange = { focusPeakingEnabled = it },
+                        analysisEnabled = analysisEnabled,
+                        onAnalysisEnabledChange = { analysisEnabled = it },
+                        rememberLastFilter = rememberLastFilter,
+                        onRememberLastFilterChange = { rememberLastFilter = it },
+                        selectedAspectRatio = selectedAspectRatio,
+                        onAspectRatioChange = { selectedAspectRatio = it },
+                        gridEnabled = gridEnabled,
+                        onGridChange = { gridEnabled = it },
+                        levelEnabled = levelEnabled,
+                        onLevelChange = { levelEnabled = it },
+                        timerSeconds = timerSeconds,
+                        onTimerChange = { timerSeconds = it },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+    }
+
+    editingPreset?.let { preset ->
+        LookEditorDialog(
+            preset = preset,
+            onDismiss = { editingPreset = null },
+            onSave = { edited ->
+                val saved = edited.copy(name = presetLibrary.uniqueName(edited.name, edited.id))
+                presetLibrary.saveEdits(saved)
+                previewCache.invalidate(saved.id)
+                val activeId = presets.getOrNull(activePresetIndex)?.id
+                builtInPresets = presetLibrary.builtInPresets()
+                customPresets = presetLibrary.customPresets()
+                presets = buildShutterPresets(builtInPresets, customPresets, selectedPresetIds)
+                activePresetIndex = presets.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
+                pendingPresetIndex = activePresetIndex
+                editingPreset = null
+                hostView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+            }
+        )
     }
 }
 
@@ -827,7 +1194,8 @@ private fun PresetLibrarySheet(
     previewCache: FilterPreviewCache,
     importing: Boolean,
     onToggle: (Preset) -> Unit,
-    onImport: () -> Unit
+    onImport: () -> Unit,
+    onEdit: (Preset) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -855,16 +1223,16 @@ private fun PresetLibrarySheet(
                 }
             }
             Text(
-                "Antippen, um die Kamera-Leiste anzupassen",
+                "Antippen zum Aktivieren · lange halten zum Bearbeiten",
                 modifier = Modifier.padding(top = 3.dp),
                 color = Color.White.copy(alpha = .58f),
                 style = MaterialTheme.typography.bodySmall
             )
         }
         Spacer(Modifier.height(7.dp))
-        PresetSection("Trending", trending, selectedIds, previewCache, onToggle)
-        PresetSection("Zuletzt benutzt", recent, selectedIds, previewCache, onToggle, emptyText = "Noch keine Filter benutzt")
-        PresetSection("Von dir", custom, selectedIds, previewCache, onToggle, emptyText = "Importierte Lightroom-Filter erscheinen hier")
+        PresetSection("Trending", trending, selectedIds, previewCache, onToggle, onEdit)
+        PresetSection("Zuletzt benutzt", recent, selectedIds, previewCache, onToggle, onEdit, emptyText = "Noch keine Filter benutzt")
+        PresetSection("Von dir", custom, selectedIds, previewCache, onToggle, onEdit, emptyText = "Importierte Lightroom-Filter erscheinen hier")
         Button(
             onClick = onImport,
             enabled = !importing,
@@ -872,8 +1240,283 @@ private fun PresetLibrarySheet(
             shape = RoundedCornerShape(20.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
         ) {
-            Text(if (importing) "Preset wird importiert …" else "Lightroom-Preset importieren", fontWeight = FontWeight.Bold)
+            Text(if (importing) "Presets werden importiert …" else "Lightroom-Presets importieren", fontWeight = FontWeight.Bold)
         }
+    }
+}
+
+@Composable
+private fun CameraSettingsSheet(
+    zebraMode: Int,
+    onZebraModeChange: (Int) -> Unit,
+    focusPeakingEnabled: Boolean,
+    onFocusPeakingChange: (Boolean) -> Unit,
+    analysisEnabled: Boolean,
+    onAnalysisEnabledChange: (Boolean) -> Unit,
+    rememberLastFilter: Boolean,
+    onRememberLastFilterChange: (Boolean) -> Unit,
+    selectedAspectRatio: Float,
+    onAspectRatioChange: (Float) -> Unit,
+    gridEnabled: Boolean,
+    onGridChange: (Boolean) -> Unit,
+    levelEnabled: Boolean,
+    onLevelChange: (Boolean) -> Unit,
+    timerSeconds: Int,
+    onTimerChange: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(24.dp)
+    ) {
+        SettingsSection(
+            title = "Aufnahme & Verhalten",
+            description = "Auslöser, Startverhalten und persönliche Vorgaben"
+        ) {
+            SettingSwitch(
+                "Letzten Filter merken",
+                "Beim nächsten Start wieder mit dem zuletzt ausgewählten Filter öffnen",
+                rememberLastFilter,
+                onRememberLastFilterChange
+            )
+            SettingsDivider()
+            SettingGroup("Selbstauslöser") {
+                SegmentedSelector(
+                    options = listOf(0 to "Aus", 3 to "3 s", 10 to "10 s"),
+                    selected = timerSeconds,
+                    onSelected = onTimerChange
+                )
+            }
+            Text(
+                "Die Lautstärketasten lösen die Kamera ebenfalls aus und verwenden den gewählten Timer.",
+                color = Color.White.copy(alpha = .48f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+
+        SettingsSection(
+            title = "Belichtung & Fokus",
+            description = "Werkzeuge zur technischen Bildkontrolle"
+        ) {
+            SettingSwitch(
+                "Histogramm & RGB-Waveform",
+                "Belichtungsanalyse oberhalb des Suchers anzeigen",
+                analysisEnabled,
+                onAnalysisEnabledChange
+            )
+            SettingsDivider()
+            SettingGroup("Zebra-Streifen") {
+                SegmentedSelector(
+                    options = listOf(0 to "Aus", 1 to "Leicht", 2 to "Intensiv"),
+                    selected = zebraMode,
+                    onSelected = onZebraModeChange
+                )
+            }
+            SettingsDivider()
+            SettingSwitch(
+                "Fokus Peaking",
+                "Markiert scharfe Kanten rot",
+                focusPeakingEnabled,
+                onFocusPeakingChange
+            )
+        }
+
+        SettingsSection(
+            title = "Komposition",
+            description = "Ausschnitt, Raster und Ausrichtung"
+        ) {
+            SettingGroup("Seitenverhältnis") {
+                SegmentedSelector(
+                    options = listOf(
+                        3f / 4f to "4:3",
+                        2f / 3f to "3:2",
+                        1f to "1:1",
+                        9f / 16f to "16:9",
+                        9f / 21f to "21:9"
+                    ),
+                    selected = selectedAspectRatio,
+                    onSelected = onAspectRatioChange
+                )
+            }
+            SettingsDivider()
+            SettingSwitch("Fotogitter", "Drittelraster im Sucher", gridEnabled, onGridChange)
+            SettingsDivider()
+            SettingSwitch("Wasserwaage", "Horizontale Ausrichtung im Sucher", levelEnabled, onLevelChange)
+        }
+        Spacer(Modifier.height(4.dp))
+    }
+}
+
+@Composable
+private fun SettingsSection(
+    title: String,
+    description: String,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        Column(modifier = Modifier.padding(horizontal = 4.dp)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.White
+            )
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = .48f)
+            )
+        }
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = Color.White.copy(alpha = .055f),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = .07f))
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                content = content
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsDivider() {
+    HorizontalDivider(color = Color.White.copy(alpha = .075f))
+}
+
+@Composable
+private fun SettingGroup(title: String, content: @Composable () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, style = MaterialTheme.typography.titleSmall, color = Color.White.copy(alpha = .72f))
+        content()
+    }
+}
+
+@Composable
+private fun SettingSwitch(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(description, color = Color.White.copy(alpha = .5f), style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+@Composable
+private fun <T> SegmentedSelector(
+    options: List<Pair<T, String>>,
+    selected: T,
+    onSelected: (T) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.White.copy(alpha = .07f))
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        options.forEach { (value, label) ->
+            val active = value == selected
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(if (active) Color.White else Color.Transparent)
+                    .clickable { onSelected(value) }
+                    .padding(horizontal = 4.dp, vertical = 9.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    label,
+                    color = if (active) Color.Black else Color.White.copy(alpha = .72f),
+                    fontSize = 11.sp,
+                    fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LookEditorDialog(
+    preset: Preset,
+    onDismiss: () -> Unit,
+    onSave: (Preset) -> Unit
+) {
+    var name by remember(preset.id) { mutableStateOf(preset.name) }
+    var intensity by remember(preset.id) { mutableFloatStateOf(preset.intensity) }
+    var grain by remember(preset.id) { mutableFloatStateOf(preset.grain) }
+    var halation by remember(preset.id) { mutableFloatStateOf(preset.halation) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1A1A1A),
+        title = { Text("Look bearbeiten") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it.take(40) },
+                    label = { Text("Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                LookSlider("Intensität", intensity, { intensity = it })
+                LookSlider("Grain", grain, { grain = it })
+                LookSlider("Halation", halation, { halation = it })
+                Text(
+                    "Grain und Halation werden unabhängig vom importierten Preset angewendet.",
+                    color = Color.White.copy(alpha = .52f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = name.isNotBlank(),
+                onClick = {
+                    onSave(
+                        preset.copy(
+                            name = name.trim(),
+                            intensity = intensity,
+                            grain = grain,
+                            halation = halation
+                        )
+                    )
+                }
+            ) { Text("Sichern") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } }
+    )
+}
+
+@Composable
+private fun LookSlider(label: String, value: Float, onValueChange: (Float) -> Unit) {
+    Column {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, fontWeight = FontWeight.Medium)
+            Text("${(value * 100).roundToInt()}%", fontFamily = FontFamily.Monospace, color = Color.White.copy(alpha = .64f))
+        }
+        Slider(value = value, onValueChange = onValueChange, valueRange = 0f..1f)
     }
 }
 
@@ -884,6 +1527,7 @@ private fun PresetSection(
     selectedIds: Set<String>,
     previewCache: FilterPreviewCache,
     onToggle: (Preset) -> Unit,
+    onEdit: (Preset) -> Unit,
     emptyText: String = ""
 ) {
     Column(modifier = Modifier.padding(bottom = 11.dp).animateContentSize()) {
@@ -905,7 +1549,8 @@ private fun PresetSection(
                         preset = preset,
                         selected = preset.id in selectedIds,
                         previewCache = previewCache,
-                        onClick = { onToggle(preset) }
+                        onClick = { onToggle(preset) },
+                        onLongClick = { onEdit(preset) }
                     )
                 }
             }
@@ -913,6 +1558,7 @@ private fun PresetSection(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PresetLibraryCard(
     preset: Preset,
@@ -921,7 +1567,8 @@ private fun PresetLibraryCard(
     cardSize: Dp = 108.dp,
     cornerRadius: Dp = 22.dp,
     labelSize: androidx.compose.ui.unit.TextUnit = 21.sp,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null
 ) {
     val preview by produceState<FilterPreview?>(initialValue = null, preset.id) {
         value = previewCache.preview(preset)
@@ -954,7 +1601,12 @@ private fun PresetLibraryCard(
                 } else Modifier
             )
             .graphicsLayer { scaleX = pressScale; scaleY = pressScale }
-            .clickable(interactionSource = interactionSource, indication = LocalIndication.current, onClick = onClick),
+            .combinedClickable(
+                interactionSource = interactionSource,
+                indication = LocalIndication.current,
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         shape = shape,
         border = if (selected && preview != null) {
             androidx.compose.foundation.BorderStroke(2.5.dp, requireNotNull(activeAccent))
@@ -980,18 +1632,291 @@ private fun PresetLibraryCard(
                     Modifier.matchParentSize().background(Color(filtered.accentColor).copy(alpha = selectedTint))
                 )
             }
-            Text(
-                filterCode(preset),
-                color = if (selected) HdrWhite else Color.White,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Black,
-                fontSize = labelSize,
-                letterSpacing = if (cardSize < 70.dp) .3.sp else 1.2.sp,
-                style = MaterialTheme.typography.titleMedium.copy(
-                    shadow = if (selected && activeAccent != null) {
-                        Shadow(color = activeAccent.copy(alpha = .9f), blurRadius = 10f)
-                    } else null
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color.Black.copy(alpha = .9f))
+                        )
+                    )
+                    .padding(horizontal = if (cardSize < 70.dp) 3.dp else 8.dp, vertical = if (cardSize < 70.dp) 4.dp else 9.dp)
+            ) {
+                Text(
+                    preset.name,
+                    color = if (selected) HdrWhite else Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = if (cardSize < 70.dp) 7.sp else 12.sp,
+                    maxLines = 1,
+                    softWrap = false,
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        shadow = if (selected && activeAccent != null) {
+                            Shadow(color = activeAccent.copy(alpha = .9f), blurRadius = 8f)
+                        } else null
+                    )
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CameraAnalysisControlBar(
+    analysis: PreviewAnalysis,
+    analysisEnabled: Boolean,
+    shutterOptions: List<Long>,
+    selectedShutter: Long,
+    shutterManual: Boolean,
+    manualExposureSupported: Boolean,
+    onShutterSelected: (Long) -> Unit,
+    onShutterReset: () -> Unit,
+    evOptions: List<Float>,
+    selectedEv: Float,
+    evManual: Boolean,
+    onEvSelected: (Float) -> Unit,
+    onEvReset: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp)
+            .height(76.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        VerticalCameraWheel(
+            label = "",
+            values = shutterOptions,
+            selectedValue = selectedShutter,
+            formatter = ::formatExposureTime,
+            distance = { a, b -> abs(a.toDouble() - b.toDouble()) },
+            manual = shutterManual,
+            enabled = manualExposureSupported,
+            onSelected = onShutterSelected,
+            onReset = onShutterReset,
+            modifier = Modifier.weight(1f).fillMaxHeight()
+        )
+        Box(
+            modifier = Modifier.weight(1f).fillMaxHeight().padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (analysisEnabled) {
+                HistogramView(
+                    values = analysis.luminanceHistogram,
+                    modifier = Modifier.fillMaxWidth().height(38.dp)
+                )
+            }
+        }
+        Box(
+            modifier = Modifier.weight(1f).fillMaxHeight().padding(horizontal = 4.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (analysisEnabled) {
+                RgbWaveformView(
+                    analysis = analysis,
+                    modifier = Modifier.fillMaxWidth().height(38.dp)
+                )
+            }
+        }
+        VerticalCameraWheel(
+            label = "EV",
+            values = evOptions,
+            selectedValue = selectedEv,
+            formatter = { value -> if (abs(value) < .01f) "±0" else String.format(Locale.US, "%+.1f", value) },
+            distance = { a, b -> abs(a - b).toDouble() },
+            manual = evManual,
+            onSelected = onEvSelected,
+            onReset = onEvReset,
+            modifier = Modifier.weight(1f).fillMaxHeight()
+        )
+    }
+}
+
+@Composable
+private fun HistogramView(values: FloatArray, modifier: Modifier = Modifier) {
+    Canvas(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.White.copy(alpha = .035f))
+            .padding(6.dp)
+    ) {
+        if (values.isEmpty()) return@Canvas
+        val barWidth = size.width / values.size
+        values.forEachIndexed { index, value ->
+            val height = value.coerceIn(0f, 1f) * size.height
+            drawLine(
+                color = Color.White.copy(alpha = .78f),
+                start = Offset(index * barWidth, size.height),
+                end = Offset(index * barWidth, size.height - height),
+                strokeWidth = max(1f, barWidth)
+            )
+        }
+    }
+}
+
+@Composable
+private fun RgbWaveformView(analysis: PreviewAnalysis, modifier: Modifier = Modifier) {
+    Canvas(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.White.copy(alpha = .035f))
+            .padding(6.dp)
+    ) {
+        fun drawChannel(values: FloatArray, color: Color) {
+            if (values.size < 2) return
+            for (index in 1 until values.size) {
+                val x0 = (index - 1f) / (values.size - 1f) * size.width
+                val x1 = index.toFloat() / (values.size - 1f) * size.width
+                drawLine(
+                    color = color.copy(alpha = .84f),
+                    start = Offset(x0, size.height * (1f - values[index - 1].coerceIn(0f, 1f))),
+                    end = Offset(x1, size.height * (1f - values[index].coerceIn(0f, 1f))),
+                    strokeWidth = 1.15.dp.toPx()
+                )
+            }
+        }
+        drawChannel(analysis.redWaveform, Color(0xFFFF453A))
+        drawChannel(analysis.greenWaveform, Color(0xFF32D74B))
+        drawChannel(analysis.blueWaveform, Color(0xFF64D2FF))
+    }
+}
+
+@Composable
+private fun <T> VerticalCameraWheel(
+    label: String,
+    values: List<T>,
+    selectedValue: T,
+    formatter: (T) -> String,
+    distance: (T, T) -> Double,
+    manual: Boolean,
+    enabled: Boolean = true,
+    onSelected: (T) -> Unit,
+    onReset: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (values.isEmpty()) return
+    val view = LocalView.current
+    val selectedIndex = values.indices.minByOrNull { distance(values[it], selectedValue) } ?: 0
+    val latestIndex by rememberUpdatedState(selectedIndex)
+    var accumulatedDrag by remember { mutableFloatStateOf(0f) }
+    val draggableState = rememberDraggableState { delta ->
+        accumulatedDrag += delta
+        val threshold = 17f
+        while (abs(accumulatedDrag) >= threshold) {
+            val direction = if (accumulatedDrag > 0f) -1 else 1
+            val next = (latestIndex + direction).coerceIn(0, values.lastIndex)
+            if (next != latestIndex) {
+                onSelected(values[next])
+                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            }
+            accumulatedDrag -= if (accumulatedDrag > 0f) threshold else -threshold
+        }
+    }
+    val borderColor = if (manual) Color(0xFFFF3B30).copy(alpha = .78f) else Color.White.copy(alpha = .08f)
+    Column(
+        modifier = modifier
+            .padding(horizontal = 3.dp)
+            .clip(RoundedCornerShape(11.dp))
+            .border(1.dp, borderColor, RoundedCornerShape(11.dp))
+            .background(Color.White.copy(alpha = .035f))
+            .draggable(
+                state = draggableState,
+                orientation = Orientation.Vertical,
+                enabled = enabled,
+                onDragStopped = { accumulatedDrag = 0f }
+            )
+            .clickable(enabled = manual) { onReset() }
+            .padding(horizontal = 3.dp, vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = selectedIndex.takeIf { it > 0 }?.let { formatter(values[it - 1]) } ?: " ",
+            color = Color.White.copy(alpha = .18f),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 8.sp,
+            maxLines = 1,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Text(
+            text = formatter(values[selectedIndex]).let { value ->
+                if (label.isBlank()) value else "$label $value"
+            },
+            color = if (!enabled) Color.White.copy(alpha = .34f) else if (manual) Color(0xFFFF3B30) else Color.White,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 10.sp,
+            maxLines = 1,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Text(
+            text = selectedIndex.takeIf { it < values.lastIndex }?.let { formatter(values[it + 1]) } ?: " ",
+            color = Color.White.copy(alpha = .18f),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 8.sp,
+            maxLines = 1,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+private fun CameraGuidesOverlay(
+    selectedAspectRatio: Float,
+    gridEnabled: Boolean,
+    levelEnabled: Boolean,
+    deviceRoll: Float
+) {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val previewRatio = size.width / size.height
+        if (abs(selectedAspectRatio - previewRatio) > .01f) {
+            if (selectedAspectRatio < previewRatio) {
+                val contentWidth = size.height * selectedAspectRatio
+                val side = (size.width - contentWidth) / 2f
+                drawRect(Color.Black.copy(alpha = .72f), size = androidx.compose.ui.geometry.Size(side, size.height))
+                drawRect(
+                    Color.Black.copy(alpha = .72f),
+                    topLeft = Offset(size.width - side, 0f),
+                    size = androidx.compose.ui.geometry.Size(side, size.height)
+                )
+            } else {
+                val contentHeight = size.width / selectedAspectRatio
+                val top = (size.height - contentHeight) / 2f
+                drawRect(Color.Black.copy(alpha = .72f), size = androidx.compose.ui.geometry.Size(size.width, top))
+                drawRect(
+                    Color.Black.copy(alpha = .72f),
+                    topLeft = Offset(0f, size.height - top),
+                    size = androidx.compose.ui.geometry.Size(size.width, top)
+                )
+            }
+        }
+        if (gridEnabled) {
+            val gridColor = Color.White.copy(alpha = .42f)
+            for (fraction in listOf(1f / 3f, 2f / 3f)) {
+                drawLine(gridColor, Offset(size.width * fraction, 0f), Offset(size.width * fraction, size.height), 1.dp.toPx())
+                drawLine(gridColor, Offset(0f, size.height * fraction), Offset(size.width, size.height * fraction), 1.dp.toPx())
+            }
+        }
+        if (levelEnabled) {
+            val radians = Math.toRadians(deviceRoll.toDouble())
+            val halfLength = 46.dp.toPx()
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val dx = (kotlin.math.cos(radians) * halfLength).toFloat()
+            val dy = (kotlin.math.sin(radians) * halfLength).toFloat()
+            val leveled = abs(deviceRoll) < 1.2f
+            drawLine(
+                color = if (leveled) Color(0xFF32D74B) else Color.White,
+                start = Offset(center.x - dx, center.y - dy),
+                end = Offset(center.x + dx, center.y + dy),
+                strokeWidth = 2.dp.toPx()
+            )
+            drawCircle(
+                color = if (leveled) Color(0xFF32D74B) else Color.White.copy(alpha = .72f),
+                radius = 3.dp.toPx(),
+                center = center
             )
         }
     }
@@ -1006,11 +1931,15 @@ fun IdleTelemetryShutterRow(
     shutterPressed: Boolean,
     accentColor: Color,
     captureFormat: String,
+    rawCaptureSupported: Boolean,
     onFormatToggle: () -> Unit,
-    isoBoostEnabled: Boolean,
-    shutterBoostEnabled: Boolean,
-    onIsoBoostToggle: () -> Unit,
-    onShutterBoostToggle: () -> Unit,
+    isoOptions: List<Int>,
+    selectedIso: Int,
+    isoManual: Boolean,
+    manualIsoSupported: Boolean,
+    onIsoSelected: (Int) -> Unit,
+    onIsoReset: () -> Unit,
+    onSettingsClick: () -> Unit,
     onShutterClick: () -> Unit,
     onShutterSwipe: () -> Unit
 ) {
@@ -1031,22 +1960,17 @@ fun IdleTelemetryShutterRow(
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Left 1: ISO
-        Text(
-            text = buildAnnotatedString {
-                withStyle(style = SpanStyle(color = Color(0xFFFF3B30), fontWeight = FontWeight.Bold)) {
-                    append(if (isoBoostEnabled) "ISO+ " else "ISO ")
-                }
-                withStyle(style = SpanStyle(color = Color.White, fontWeight = FontWeight.Medium)) {
-                    append("${telemetry.iso}")
-                }
-            },
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .weight(1f)
-                .clickable { onIsoBoostToggle() }
+        VerticalCameraWheel(
+            label = "ISO",
+            values = isoOptions,
+            selectedValue = selectedIso,
+            formatter = Int::toString,
+            distance = { a, b -> abs(a - b).toDouble() },
+            manual = isoManual,
+            enabled = manualIsoSupported,
+            onSelected = onIsoSelected,
+            onReset = onIsoReset,
+            modifier = Modifier.weight(1f).height(76.dp)
         )
 
         // Left 2: Format (JPG / RAW / RAW+JPG)
@@ -1059,7 +1983,7 @@ fun IdleTelemetryShutterRow(
             modifier = Modifier
                 .weight(1f)
                 .clip(RoundedCornerShape(4.dp))
-                .clickable { onFormatToggle() }
+                .then(if (rawCaptureSupported) Modifier.clickable { onFormatToggle() } else Modifier)
                 .padding(horizontal = 6.dp, vertical = 4.dp)
         )
 
@@ -1087,30 +2011,17 @@ fun IdleTelemetryShutterRow(
             )
         }
 
-        // Right 1: Shutterspeed
-        Text(
-            text = if (shutterBoostEnabled) "${telemetry.shutterSpeed}+" else telemetry.shutterSpeed,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            color = Color.White,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .weight(1f)
-                .clickable { onShutterBoostToggle() }
-        )
+        Spacer(modifier = Modifier.weight(1f))
 
-        // Right 2: Settings Button
         Text(
-            text = "Settings",
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
+            text = "⚙",
+            fontSize = 23.sp,
             fontWeight = FontWeight.Medium,
             color = Color.White,
             textAlign = TextAlign.Center,
             modifier = Modifier
                 .weight(1f)
-                .springClickable(feedback = HapticFeedbackConstants.CLOCK_TICK) { /* Settings dialog hook */ }
+                .springClickable(feedback = HapticFeedbackConstants.CLOCK_TICK) { onSettingsClick() }
         )
     }
 }
@@ -1240,9 +2151,9 @@ fun MinimalZoomIndicator(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        // Current zoom level text (e.g. 1.3)
+        // Current zoom level text (e.g. 1.3).
         Text(
-            text = String.format("%.1f", currentZoom),
+            text = String.format(Locale.US, "%.1f", currentZoom),
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
@@ -1257,11 +2168,9 @@ fun MinimalZoomIndicator(
 @Composable
 fun GaussianZoomRocker(
     currentZoom: Float,
-    onZoomChange: (Float) -> Unit,
+    focalLengths: List<CameraEngine.FocalLengthOption>,
     motionVelocity: Float = 0f
 ) {
-    // Zoom range with a 0.2x rocker scale. 0.5x remains a dedicated ultra-wide stop.
-    val minZoom = 0.5f
     val zoomTicks = remember {
         buildList {
             add(0.5f)
@@ -1272,8 +2181,23 @@ fun GaussianZoomRocker(
             }
         }
     }
-
-    val milestones = listOf(0.5f, 1.0f, 2.0f, 3.0f, 5.0f)
+    fun zoomToIndex(zoom: Float): Float = if (zoom <= 0.6f) {
+        (zoom - 0.5f) / 0.1f
+    } else {
+        1f + (zoom - 0.6f) / 0.2f
+    }
+    val currentIndex = zoomToIndex(currentZoom)
+    val focalLengthLabels = remember(focalLengths, zoomTicks) {
+        focalLengths
+            .groupBy { focalLength ->
+                zoomTicks.indices.minByOrNull { index ->
+                    abs(zoomTicks[index] - focalLength.zoomRatio)
+                } ?: 0
+            }
+            .mapValues { (_, options) ->
+                options.joinToString(" / ") { formatFocalLength(it.millimeters) }
+            }
+    }
     val motionTrail by animateFloatAsState(
         targetValue = motionVelocity,
         animationSpec = tween(180),
@@ -1286,44 +2210,47 @@ fun GaussianZoomRocker(
             .height(68.dp),
         contentAlignment = Alignment.TopCenter
     ) {
-        // Ticks and milestone labels share the exact same moving coordinate system.
+        // Every zoom step gets a line; focal lengths are labels attached to their
+        // nearest zoom line and do not replace the full scale.
         Canvas(modifier = Modifier.fillMaxSize()) {
                 val centerPx = size.width / 2f
-                val spacingPx = 9.dp.toPx()
+                val spacingPx = 10.dp.toPx()
                 val tickAreaHeight = 42.dp.toPx()
 
-                fun zoomToIndex(zoom: Float): Float = if (zoom <= 0.6f) {
-                    (zoom - 0.5f) / 0.1f
-                } else {
-                    1f + (zoom - 0.6f) / 0.2f
-                }
-                val currentIndex = zoomToIndex(currentZoom)
-
                 for (i in zoomTicks.indices) {
-                    val tickZoom = zoomTicks[i]
                     val distFromCenterIndex = i - currentIndex
                     val tickX = centerPx + distFromCenterIndex * spacingPx
 
                     // Clip ticks outside visible bounds
                     if (tickX < 0 || tickX > size.width) continue
 
-                    // Gaussian Normal Distribution Height Math: h = hBase + (hMax - hBase) * exp(- (d^2) / (2 * sigma^2))
+                    // Keep the active zoom area prominent, while also giving every tick
+                    // a visual bias towards the physical center of the rocker. This makes
+                    // the center of the scale read as the visual anchor, even while it moves.
                     val absDist = abs(distFromCenterIndex.toFloat())
                     val sigma = 2.2f
                     val gaussianWeight = exp(- (absDist * absDist) / (2f * sigma * sigma))
 
+                    val distanceFromScreenCenter = abs(tickX - centerPx)
+                    val centerProximity = (
+                        1f - distanceFromScreenCenter / (size.width / 2f)
+                    ).coerceIn(0f, 1f)
+                    val centerWeight = centerProximity * centerProximity
+                    val visualWeight = (gaussianWeight * 0.72f + centerWeight * 0.28f)
+                        .coerceIn(0f, 1f)
+
                     val baseHeight = 10.dp.toPx()
                     val maxHeight = 34.dp.toPx()
-                    val tickHeight = baseHeight + (maxHeight - baseHeight) * gaussianWeight
+                    val tickHeight = baseHeight + (maxHeight - baseHeight) * visualWeight
 
                     // Edge alpha fade out
                     val distFromEdge = minOf(tickX, size.width - tickX)
                     val edgeFade = (distFromEdge / (size.width * 0.25f)).coerceIn(0f, 1f)
 
                     val strokeColor = Color.White.copy(
-                        alpha = (0.2f + 0.6f * gaussianWeight) * edgeFade
+                        alpha = (0.16f + 0.72f * visualWeight) * edgeFade
                     )
-                    val strokeWidth = 1.25.dp.toPx()
+                    val strokeWidth = (1.1f + 0.8f * visualWeight).dp.toPx()
 
                     if (abs(motionTrail) > 0.5f) {
                         for (trail in 1..3) {
@@ -1347,7 +2274,7 @@ fun GaussianZoomRocker(
                     )
                 }
 
-                // Fixed indicator: the continuously moving scale can stop between ticks.
+                // Fixed indicator: the scale can stop between two 0.2 steps.
                 drawLine(
                     color = Color(0xFFFF3B30),
                     start = Offset(centerPx, 4.dp.toPx()),
@@ -1360,26 +2287,24 @@ fun GaussianZoomRocker(
                     typeface = android.graphics.Typeface.MONOSPACE
                     textSize = 11.sp.toPx()
                 }
-                milestones.forEach { milestone ->
-                    val milestoneIndex = zoomToIndex(milestone)
-                    val labelX = centerPx + (milestoneIndex - currentIndex) * spacingPx
+                focalLengthLabels.forEach { (tickIndex, label) ->
+                    val labelX = centerPx + (tickIndex - currentIndex) * spacingPx
                     if (labelX < 0f || labelX > size.width) return@forEach
                     val distFromEdge = minOf(labelX, size.width - labelX)
                     val edgeFade = (distFromEdge / (size.width * 0.2f)).coerceIn(0f, 1f)
-                    val isSelected = abs(currentZoom - milestone) < 0.05f
-                    labelPaint.color = if (isSelected) 0xFFFF3B30.toInt() else 0xFFFFFFFF.toInt()
-                    labelPaint.alpha = if (isSelected) 255 else (128 * edgeFade).roundToInt()
+                    labelPaint.color = 0xFFFFFFFF.toInt()
+                    labelPaint.alpha = (180 * edgeFade).roundToInt()
                     labelPaint.typeface = android.graphics.Typeface.create(
                         android.graphics.Typeface.MONOSPACE,
-                        if (isSelected) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL
+                        android.graphics.Typeface.NORMAL
                     )
                     drawContext.canvas.nativeCanvas.drawText(
-                        String.format("%.1f", milestone),
+                        label,
                         labelX,
                         60.dp.toPx(),
                         labelPaint
                     )
                 }
-            }
+        }
     }
 }

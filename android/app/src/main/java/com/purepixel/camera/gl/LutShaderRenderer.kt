@@ -17,7 +17,8 @@ import com.purepixel.camera.model.LightroomPreset
 
 class LutShaderRenderer(
     private val onSurfaceReady: (SurfaceTexture) -> Unit,
-    private val requestRender: () -> Unit
+    private val requestRender: () -> Unit,
+    private val onAnalysis: (PreviewAnalysis) -> Unit = { }
 ) : GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
 
     companion object {
@@ -51,7 +52,12 @@ out vec4 fragColor;
 uniform samplerExternalOES uCameraTexture;
 uniform sampler3D uLutTexture3D;
 uniform float uEnableLut;
+uniform float uIntensity;
 uniform float uGrain;
+uniform float uExtraGrain;
+uniform float uHalation;
+uniform float uZebra;
+uniform float uFocusPeaking;
 uniform float uClarity;
 uniform float uSharpness;
 uniform float uSharpenRadius;
@@ -94,10 +100,6 @@ float roundFilmGrain(vec2 p) {
 
 void main() {
     vec4 cameraColor = texture(uCameraTexture, vTexCoord);
-    if (uEnableLut <= 0.5) {
-        fragColor = cameraColor;
-        return;
-    }
     // Shared local-detail pass for clarity, sharpening and noise reduction.
     float detailAmount = abs(uClarity) + uSharpness + uNoiseReduction.x + uNoiseReduction.y;
     if (detailAmount > 0.001) {
@@ -119,8 +121,19 @@ void main() {
     }
     
     // Trilinear 3D LUT sampling in OpenGL ES 3.0
-    vec3 lutColor = texture(uLutTexture3D, cameraColor.rgb).rgb;
-    if (uGrain > 0.0001) {
+    vec3 graded = texture(uLutTexture3D, clamp(cameraColor.rgb, 0.0, 1.0)).rgb;
+    vec3 lutColor = mix(cameraColor.rgb, graded, step(0.5, uEnableLut) * uIntensity);
+    if (uHalation > 0.001) {
+        vec2 glowStep = 3.0 / max(uResolution, vec2(1.0));
+        vec3 glow = texture(uCameraTexture, vTexCoord + vec2(glowStep.x, 0.0)).rgb;
+        glow += texture(uCameraTexture, vTexCoord - vec2(glowStep.x, 0.0)).rgb;
+        glow += texture(uCameraTexture, vTexCoord + vec2(0.0, glowStep.y)).rgb;
+        glow += texture(uCameraTexture, vTexCoord - vec2(0.0, glowStep.y)).rgb;
+        float hot = smoothstep(0.68, 1.0, dot(glow * 0.25, vec3(0.2126, 0.7152, 0.0722)));
+        lutColor += vec3(0.34, 0.075, -0.025) * hot * uHalation;
+    }
+    float combinedGrain = uGrain + uExtraGrain * 0.18;
+    if (combinedGrain > 0.0001) {
         float shortEdge = max(1.0, min(uResolution.x, uResolution.y));
         vec2 grainCoord = gl_FragCoord.xy * (1000.0 / shortEdge) / uGrainSize;
         float rounded = roundFilmGrain(grainCoord);
@@ -131,9 +144,26 @@ void main() {
         float luminance = dot(lutColor, vec3(0.2126, 0.7152, 0.0722));
         float midtonePresence = 1.0 - abs(luminance * 2.0 - 1.0);
         float grainMask = 0.72 + 0.28 * midtonePresence;
-        lutColor = clamp(lutColor + noise * uGrain * grainMask, 0.0, 1.0);
+        lutColor = clamp(lutColor + noise * combinedGrain * grainMask, 0.0, 1.0);
     }
-    fragColor = vec4(lutColor, cameraColor.a);
+    if (uFocusPeaking > 0.5) {
+        vec2 edgeStep = 1.5 / max(uResolution, vec2(1.0));
+        vec3 horizontal = texture(uCameraTexture, vTexCoord + vec2(edgeStep.x, 0.0)).rgb -
+            texture(uCameraTexture, vTexCoord - vec2(edgeStep.x, 0.0)).rgb;
+        vec3 vertical = texture(uCameraTexture, vTexCoord + vec2(0.0, edgeStep.y)).rgb -
+            texture(uCameraTexture, vTexCoord - vec2(0.0, edgeStep.y)).rgb;
+        float edge = length(horizontal) + length(vertical);
+        float peak = smoothstep(0.24, 0.42, edge);
+        lutColor = mix(lutColor, vec3(1.0, 0.12, 0.08), peak * 0.92);
+    }
+    if (uZebra > 0.5) {
+        float threshold = uZebra > 1.5 ? 0.78 : 0.91;
+        float clipped = smoothstep(threshold, threshold + 0.035, dot(lutColor, vec3(0.2126, 0.7152, 0.0722)));
+        float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / 10.0));
+        vec3 zebraColor = mix(vec3(0.03), vec3(1.0), stripe);
+        lutColor = mix(lutColor, zebraColor, clipped * (uZebra > 1.5 ? 0.9 : 0.62));
+    }
+    fragColor = vec4(clamp(lutColor, 0.0, 1.0), cameraColor.a);
 }
 """
 
@@ -185,7 +215,12 @@ void main() {
     private var cameraTextureHandle: Int = 0
     private var lutTextureHandle: Int = 0
     private var enableLutHandle: Int = 0
+    private var intensityHandle: Int = 0
     private var grainHandle: Int = 0
+    private var extraGrainHandle: Int = 0
+    private var halationHandle: Int = 0
+    private var zebraHandle: Int = 0
+    private var focusPeakingHandle: Int = 0
     private var clarityHandle: Int = 0
     private var sharpnessHandle: Int = 0
     private var sharpenRadiusHandle: Int = 0
@@ -212,6 +247,12 @@ void main() {
     @Volatile
     var isLutEnabled = false // Default to No Filter (bypassed)
     @Volatile private var grainAmount = 0f
+    @Volatile private var lookIntensity = 1f
+    @Volatile private var extraGrainAmount = 0f
+    @Volatile private var halationAmount = 0f
+    @Volatile private var zebraMode = 0f
+    @Volatile private var focusPeakingEnabled = 0f
+    @Volatile private var previewAnalysisEnabled = false
     @Volatile private var clarityAmount = 0f
     @Volatile private var sharpnessAmount = 0f
     @Volatile private var sharpenRadius = 1f
@@ -222,6 +263,8 @@ void main() {
     @Volatile private var grainRoughness = .5f
     private var viewportWidth = 1
     private var viewportHeight = 1
+    private var lastAnalysisNanos = 0L
+    private var analysisBuffer: ByteBuffer? = null
 
     init {
         android.opengl.Matrix.setIdentityM(stMatrix, 0)
@@ -244,7 +287,12 @@ void main() {
         cameraTextureHandle = GLES30.glGetUniformLocation(programId, "uCameraTexture")
         lutTextureHandle = GLES30.glGetUniformLocation(programId, "uLutTexture3D")
         enableLutHandle = GLES30.glGetUniformLocation(programId, "uEnableLut")
+        intensityHandle = GLES30.glGetUniformLocation(programId, "uIntensity")
         grainHandle = GLES30.glGetUniformLocation(programId, "uGrain")
+        extraGrainHandle = GLES30.glGetUniformLocation(programId, "uExtraGrain")
+        halationHandle = GLES30.glGetUniformLocation(programId, "uHalation")
+        zebraHandle = GLES30.glGetUniformLocation(programId, "uZebra")
+        focusPeakingHandle = GLES30.glGetUniformLocation(programId, "uFocusPeaking")
         clarityHandle = GLES30.glGetUniformLocation(programId, "uClarity")
         sharpnessHandle = GLES30.glGetUniformLocation(programId, "uSharpness")
         sharpenRadiusHandle = GLES30.glGetUniformLocation(programId, "uSharpenRadius")
@@ -355,7 +403,12 @@ void main() {
 
         GLES30.glUniformMatrix4fv(stMatrixHandle, 1, false, stMatrix, 0)
         GLES30.glUniform1f(enableLutHandle, if (isLutEnabled) 1.0f else 0.0f)
+        GLES30.glUniform1f(intensityHandle, lookIntensity)
         GLES30.glUniform1f(grainHandle, grainAmount)
+        GLES30.glUniform1f(extraGrainHandle, extraGrainAmount)
+        GLES30.glUniform1f(halationHandle, halationAmount)
+        GLES30.glUniform1f(zebraHandle, zebraMode)
+        GLES30.glUniform1f(focusPeakingHandle, focusPeakingEnabled)
         GLES30.glUniform1f(clarityHandle, clarityAmount)
         GLES30.glUniform1f(sharpnessHandle, sharpnessAmount)
         GLES30.glUniform1f(sharpenRadiusHandle, sharpenRadius)
@@ -369,6 +422,7 @@ void main() {
         GLES30.glBindVertexArray(vertexArrayId)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glBindVertexArray(0)
+        collectPreviewAnalysis()
     }
 
     override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
@@ -472,6 +526,74 @@ void main() {
         colorNoiseReduction = 0f
         isLutEnabled = true
         requestRender()
+    }
+
+    fun setLookControls(intensity: Float, grain: Float, halation: Float) {
+        lookIntensity = intensity.coerceIn(0f, 1f)
+        extraGrainAmount = grain.coerceIn(0f, 1f)
+        halationAmount = halation.coerceIn(0f, 1f)
+        requestRender()
+    }
+
+    fun setAssistSettings(zebra: Int, focusPeaking: Boolean) {
+        zebraMode = zebra.coerceIn(0, 2).toFloat()
+        focusPeakingEnabled = if (focusPeaking) 1f else 0f
+        requestRender()
+    }
+
+    fun setAnalysisEnabled(enabled: Boolean) {
+        previewAnalysisEnabled = enabled
+        if (enabled) lastAnalysisNanos = 0L
+    }
+
+    private fun collectPreviewAnalysis() {
+        if (!previewAnalysisEnabled) return
+        val now = System.nanoTime()
+        if (now - lastAnalysisNanos < 220_000_000L || viewportWidth <= 1 || viewportHeight <= 1) return
+        lastAnalysisNanos = now
+        val byteCount = viewportWidth * viewportHeight * 4
+        val buffer = analysisBuffer?.takeIf { it.capacity() >= byteCount }
+            ?: ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder()).also { analysisBuffer = it }
+        buffer.clear()
+        GLES30.glReadPixels(
+            0, 0, viewportWidth, viewportHeight,
+            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buffer
+        )
+        val histogram = FloatArray(64)
+        val red = FloatArray(40)
+        val green = FloatArray(40)
+        val blue = FloatArray(40)
+        val counts = IntArray(40)
+        val xStep = (viewportWidth / 96).coerceAtLeast(2)
+        val yStep = (viewportHeight / 72).coerceAtLeast(2)
+        var y = 0
+        while (y < viewportHeight) {
+            var x = 0
+            while (x < viewportWidth) {
+                val offset = (y * viewportWidth + x) * 4
+                val r = buffer.get(offset).toInt() and 0xff
+                val g = buffer.get(offset + 1).toInt() and 0xff
+                val b = buffer.get(offset + 2).toInt() and 0xff
+                val luma = (.2126f * r + .7152f * g + .0722f * b)
+                histogram[(luma / 4f).toInt().coerceIn(0, 63)] += 1f
+                val column = (x * red.size / viewportWidth).coerceIn(0, red.lastIndex)
+                red[column] += r / 255f
+                green[column] += g / 255f
+                blue[column] += b / 255f
+                counts[column]++
+                x += xStep
+            }
+            y += yStep
+        }
+        val maxBin = histogram.maxOrNull()?.coerceAtLeast(1f) ?: 1f
+        for (index in histogram.indices) histogram[index] /= maxBin
+        for (index in red.indices) {
+            val count = counts[index].coerceAtLeast(1)
+            red[index] /= count
+            green[index] /= count
+            blue[index] /= count
+        }
+        onAnalysis(PreviewAnalysis(histogram, red, green, blue))
     }
 
     fun disableLut() {
