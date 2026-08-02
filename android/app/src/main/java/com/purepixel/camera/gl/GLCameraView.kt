@@ -56,6 +56,9 @@ class GLCameraView(
     private val lutExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "HooruLutBuilder").apply { priority = Thread.NORM_PRIORITY - 1 }
     }
+    private val lutPreloadExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "HooruLutPreloader").apply { priority = Thread.MIN_PRIORITY }
+    }
     private val lutCache = ConcurrentHashMap<String, ByteBuffer>()
     private val presetGeneration = AtomicInteger(0)
     private val previewWatchdog = object : Runnable {
@@ -112,13 +115,7 @@ class GLCameraView(
 
         lutExecutor.execute {
             if (generation != presetGeneration.get()) return@execute
-            val prepared = lutCache[preset.id] ?: run {
-                val generated = preset.lightroom?.buildLut(LutShaderRenderer.LUT_SIZE)
-                    ?: renderer.buildBuiltInLut(preset.id)
-                    ?: return@execute
-                val cached = generated.asReadOnlyBuffer().apply { position(0) }
-                lutCache.putIfAbsent(preset.id, cached) ?: cached
-            }
+            val prepared = prepareLut(preset) ?: return@execute
             if (generation != presetGeneration.get()) return@execute
             val upload = prepared.duplicate().apply { position(0) }
             queueEvent {
@@ -128,6 +125,30 @@ class GLCameraView(
                 renderer.setLookControls(preset.intensity, preset.grain, preset.halation)
             }
         }
+    }
+
+    /**
+     * Builds the small set of commonly used LUTs without occupying the executor
+     * that handles an active user selection. A page turn can therefore always
+     * jump ahead of background preparation work.
+     */
+    fun preloadPresets(presets: List<Preset>) {
+        val uncached = presets.filterNot {
+            it.id == "no_filter" || it.id == "android_processing" || lutCache.containsKey(it.id)
+        }
+        if (uncached.isEmpty()) return
+        lutPreloadExecutor.execute {
+            uncached.forEach(::prepareLut)
+        }
+    }
+
+    private fun prepareLut(preset: Preset): ByteBuffer? {
+        lutCache[preset.id]?.let { return it }
+        val generated = preset.lightroom?.buildLut(LutShaderRenderer.LUT_SIZE)
+            ?: renderer.buildBuiltInLut(preset.id)
+            ?: return null
+        val cached = generated.asReadOnlyBuffer().apply { position(0) }
+        return lutCache.putIfAbsent(preset.id, cached) ?: cached
     }
 
     fun setAssistSettings(zebraMode: Int, focusPeaking: Boolean) {
@@ -202,30 +223,33 @@ fun createPresetColorMatrix(presetId: String): ColorMatrix? {
             0.01f, 0.03f, 0.96f, 0f, -2f,
             0f, 0f, 0f, 1f, 0f
         ))
-        "leica_mono" -> ColorMatrix().apply { setSaturation(0f) }
-        "teal_orange" -> ColorMatrix(floatArrayOf(
-            1.08f, 0f, 0.08f, 0f, 5f, 0f, 0.98f, 0.04f, 0f, 0f,
-            0.02f, 0.08f, 1.12f, 0f, -4f, 0f, 0f, 0f, 1f, 0f
+        "silver_push" -> ColorMatrix(floatArrayOf(
+            .36f, .72f, .12f, 0f, -22f, .36f, .72f, .12f, 0f, -22f,
+            .36f, .72f, .12f, 0f, -22f, 0f, 0f, 0f, 1f, 0f
         ))
-        "portra_400", "warm_fade" -> ColorMatrix(floatArrayOf(
-            1.10f, 0.03f, 0f, 0f, 8f, 0.02f, 1.02f, 0f, 0f, 3f,
-            0f, 0.02f, 0.92f, 0f, 2f, 0f, 0f, 0f, 1f, 0f
+        "noir_halide" -> ColorMatrix(floatArrayOf(
+            .44f, .87f, .14f, 0f, -48f, .44f, .87f, .14f, 0f, -48f,
+            .44f, .87f, .14f, 0f, -48f, 0f, 0f, 0f, 1f, 0f
         ))
-        "classic_chrome", "cinema_green" -> ColorMatrix(floatArrayOf(
-            0.96f, 0.04f, 0f, 0f, -3f, 0f, 1.10f, 0.02f, 0f, 2f,
-            0.03f, 0.04f, 0.91f, 0f, -2f, 0f, 0f, 0f, 1f, 0f
+        "infra_flora" -> ColorMatrix(floatArrayOf(
+            .42f, 1.24f, -.16f, 0f, 4f, .06f, .22f, .34f, 0f, -5f,
+            .12f, .08f, 1.08f, 0f, 8f, 0f, 0f, 0f, 1f, 0f
         ))
-        "cool_night" -> ColorMatrix(floatArrayOf(
-            0.88f, 0f, 0.02f, 0f, -4f, 0f, 0.98f, 0.06f, 0f, 0f,
-            0.02f, 0.05f, 1.18f, 0f, 8f, 0f, 0f, 0f, 1f, 0f
+        "thermal_bloom" -> ColorMatrix(floatArrayOf(
+            .72f, 1.22f, .08f, 0f, 8f, .18f, .12f, .42f, 0f, -8f,
+            .30f, .04f, 1.20f, 0f, 12f, 0f, 0f, 0f, 1f, 0f
         ))
-        "high_contrast" -> ColorMatrix(floatArrayOf(
-            1.28f, 0f, 0f, 0f, -32f, 0f, 1.28f, 0f, 0f, -32f,
-            0f, 0f, 1.28f, 0f, -32f, 0f, 0f, 0f, 1f, 0f
+        "clean_frame", "soft_daylight" -> ColorMatrix(floatArrayOf(
+            1.02f, .01f, -.01f, 0f, 2f, .01f, 1.01f, -.01f, 0f, 2f,
+            -.01f, .02f, .98f, 0f, 0f, 0f, 0f, 0f, 1f, 0f
         ))
-        "soft_rose" -> ColorMatrix(floatArrayOf(
-            1.10f, 0.04f, 0.03f, 0f, 6f, 0.02f, 0.96f, 0.02f, 0f, 1f,
-            0.04f, 0.02f, 1.02f, 0f, 4f, 0f, 0f, 0f, 1f, 0f
+        "coastal_clear" -> ColorMatrix(floatArrayOf(
+            .98f, .02f, .02f, 0f, 0f, 0f, 1.03f, .02f, 0f, 2f,
+            .01f, .05f, 1.03f, 0f, 3f, 0f, 0f, 0f, 1f, 0f
+        ))
+        "muted_city", "summer_glass" -> ColorMatrix(floatArrayOf(
+            1.01f, .02f, -.01f, 0f, 1f, .02f, .99f, -.01f, 0f, 1f,
+            .01f, .03f, .95f, 0f, -1f, 0f, 0f, 0f, 1f, 0f
         ))
         else -> ColorMatrix()
     }

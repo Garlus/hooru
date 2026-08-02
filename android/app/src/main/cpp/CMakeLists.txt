@@ -8,6 +8,17 @@ add_library(
     FastJpegEncoder.cpp
 )
 
+# Still-photo processing is dominated by tight per-pixel math. Android's debug
+# variant otherwise leaves this native code effectively unoptimized, which makes
+# locally installed APKs dramatically slower than production builds.
+target_compile_options(
+    hooru_native
+    PRIVATE
+    -O3
+    -fno-math-errno
+    -ffp-contract=fast
+)
+
 target_link_options(
     hooru_native
     PRIVATE

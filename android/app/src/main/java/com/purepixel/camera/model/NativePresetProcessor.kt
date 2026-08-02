@@ -45,6 +45,30 @@ internal object NativePresetProcessor {
         }
     }
 
+    fun finishLook(
+        source: Bitmap,
+        filtered: Bitmap,
+        destination: Bitmap,
+        intensity: Float,
+        grain: Float,
+        halation: Float
+    ): Boolean {
+        if (!available) return false
+        return runCatching {
+            finishLookNative(
+                source = source,
+                filtered = filtered,
+                destination = destination,
+                intensity = intensity,
+                grain = grain,
+                halation = halation
+            )
+        }.getOrElse {
+            Log.w(TAG, "Native look finishing failed; using Kotlin fallback", it)
+            false
+        }
+    }
+
     private external fun processNative(
         source: Bitmap,
         destination: Bitmap,
@@ -60,5 +84,14 @@ internal object NativePresetProcessor {
         grain: Float,
         grainSize: Float,
         grainRoughness: Float
+    ): Boolean
+
+    private external fun finishLookNative(
+        source: Bitmap,
+        filtered: Bitmap,
+        destination: Bitmap,
+        intensity: Float,
+        grain: Float,
+        halation: Float
     ): Boolean
 }

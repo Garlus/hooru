@@ -3,6 +3,7 @@ package com.purepixel.camera
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Build
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -31,6 +32,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        requestHighestRefreshRate()
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
         // Keep the camera window in the default SDR composition mode. Forcing an
@@ -63,8 +65,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
-                    primary = Color(0xFF8AB4F8),
-                    onPrimary = Color(0xFF07111F),
+                    primary = Color(0xFFFF453A),
+                    onPrimary = Color.Black,
                     surface = Color(0xFF101010),
                     surfaceVariant = Color(0xFF252525),
                     background = Color.Black
@@ -79,6 +81,22 @@ class MainActivity : ComponentActivity() {
         return ContextCompat.checkSelfPermission(
             this, Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /** Keep Compose interactions, including the settings screen, on the panel's fastest mode. */
+    @Suppress("DEPRECATION")
+    private fun requestHighestRefreshRate() {
+        val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display
+        } else {
+            windowManager.defaultDisplay
+        } ?: return
+        val refreshRate = if (Build.VERSION.SDK_INT >= 23) {
+            display.supportedModes.maxOfOrNull { it.refreshRate }
+        } else {
+            display.refreshRate
+        } ?: return
+        window.attributes = window.attributes.apply { preferredRefreshRate = refreshRate }
     }
 
     override fun onResume() {

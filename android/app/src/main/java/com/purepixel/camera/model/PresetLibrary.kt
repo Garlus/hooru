@@ -21,10 +21,54 @@ class PresetLibrary(private val context: Context) {
     private val prefs = context.getSharedPreferences("preset_library", Context.MODE_PRIVATE)
     private val customDirectory = File(context.filesDir, "lightroom_presets").apply { mkdirs() }
 
-    val trending: List<Preset>
-        get() = builtInPresets().filterNot { it.isAddButton || it.id == "no_filter" }.take(8)
+    private val packagedSodiumPresets: List<Preset> by lazy {
+        context.assets.list(PACKAGED_SODIUM_DIRECTORY).orEmpty().sorted().mapNotNull { fileName ->
+            runCatching {
+                val number = fileName.removePrefix("GX-02_").removeSuffix(".xmp")
+                val displayName = if (fileName == "vapor_grain.xmp") "Nightwire Grain" else "Nightwire $number"
+                val xmp = context.assets.open("$PACKAGED_SODIUM_DIRECTORY/$fileName")
+                    .bufferedReader().use { it.readText() }
+                Preset(
+                    id = "sodium_$number",
+                    name = displayName,
+                    accentColor = SODIUM_ACCENTS[number.toIntOrNull()?.rem(SODIUM_ACCENTS.size) ?: 0],
+                    lightroom = LightroomPreset.fromXmp(xmp, displayName),
+                    category = PresetCategory.CHROMATIC
+                )
+            }.getOrNull()
+        }
+    }
 
-    fun builtInPresets(): List<Preset> = Preset.DEFAULT_PRESETS.map(::applySavedEdits)
+    private val packagedCommunityPresets: List<Preset> by lazy {
+        listOf(
+            PACKAGED_URBAN_DIRECTORY to PresetCategory.URBAN,
+            PACKAGED_AFTERGLOW_DIRECTORY to PresetCategory.AFTERGLOW,
+            PACKAGED_WANDERLIGHT_DIRECTORY to PresetCategory.WANDERLIGHT
+        ).flatMap { (directory, category) ->
+            context.assets.list(directory).orEmpty().sorted().mapNotNull { fileName ->
+                runCatching {
+                    val id = "${category.name.lowercase()}_${fileName.removeSuffix(".xmp")}"
+                    val name = fileName.removeSuffix(".xmp").split('_').joinToString(" ") { word ->
+                        word.replaceFirstChar { it.uppercase() }
+                    }
+                    val xmp = context.assets.open("$directory/$fileName").bufferedReader().use { it.readText() }
+                    Preset(
+                        id = id,
+                        name = name,
+                        accentColor = COMMUNITY_ACCENTS[(id.hashCode() and Int.MAX_VALUE) % COMMUNITY_ACCENTS.size],
+                        lightroom = LightroomPreset.fromXmp(xmp, name),
+                        category = category
+                    )
+                }.getOrNull()
+            }
+        }
+    }
+
+    val signatureLooks: List<Preset>
+        get() = builtInPresets().filter { it.category == PresetCategory.ESSENTIALS && it.id != "no_filter" }
+
+    fun builtInPresets(): List<Preset> =
+        (Preset.DEFAULT_PRESETS + packagedSodiumPresets + packagedCommunityPresets).map(::applySavedEdits)
 
     fun customPresets(): List<Preset> = customDirectory.listFiles()
         .orEmpty()
@@ -37,7 +81,7 @@ class PresetLibrary(private val context: Context) {
                 applySavedEdits(Preset(
                     id = file.nameWithoutExtension,
                     name = lightroom.name,
-                    accentColor = android.graphics.Color.parseColor("#8AB4F8"),
+                    accentColor = android.graphics.Color.parseColor("#FF453A"),
                     assetPath = file.absolutePath,
                     lightroom = lightroom,
                     isCustom = true
@@ -74,7 +118,7 @@ class PresetLibrary(private val context: Context) {
         return Preset(
             id = id,
             name = preset.name,
-            accentColor = android.graphics.Color.parseColor("#8AB4F8"),
+            accentColor = android.graphics.Color.parseColor("#FF453A"),
             assetPath = File(customDirectory, "$id.xmp").absolutePath,
             lightroom = preset,
             isCustom = true
@@ -82,14 +126,38 @@ class PresetLibrary(private val context: Context) {
     }
 
     fun selectedIds(defaultIds: Set<String>): Set<String> {
-        val saved = prefs.getStringSet(KEY_SELECTED, null)?.toSet() ?: defaultIds
-        if (prefs.getBoolean(KEY_NEW_LOOKS_MIGRATED, false)) return saved
-        val migrated = saved + setOf("hooru_look", "android_processing")
+        var selected = prefs.getStringSet(KEY_SELECTED, null)?.toSet() ?: defaultIds
+        if (!prefs.getBoolean(KEY_FILM_LIBRARY_MIGRATED, false)) {
+            selected = (selected - LEGACY_LOOK_IDS) + defaultIds
+        }
+        if (!prefs.getBoolean(KEY_FIRST_DRAFT_REMOVED, false)) {
+            selected -= FIRST_DRAFT_LOOK_IDS
+        }
+        if (!prefs.getBoolean(KEY_CHROMATIC_REPLACED, false)) {
+            selected -= CHROMATIC_DRAFT_LOOK_IDS
+        }
+        if (!prefs.getBoolean(KEY_NEW_LOOKS_MIGRATED, false)) {
+            selected += setOf("hooru_look", "android_processing")
+        }
+
+        // Existing installations used to opt every built-in look into the shutter.
+        // Trim only that legacy all-selected state; deliberate custom selections stay intact.
+        if (!prefs.getBoolean(KEY_TEN_DEFAULTS_MIGRATED, false)) {
+            val builtInIds = Preset.DEFAULT_PRESETS.filterNot(Preset::isAddButton).map(Preset::id)
+            if (selected.containsAll(builtInIds)) {
+                selected -= builtInIds.drop(10).toSet()
+            }
+        }
+
         prefs.edit()
-            .putStringSet(KEY_SELECTED, migrated)
+            .putStringSet(KEY_SELECTED, selected)
             .putBoolean(KEY_NEW_LOOKS_MIGRATED, true)
+            .putBoolean(KEY_TEN_DEFAULTS_MIGRATED, true)
+            .putBoolean(KEY_FILM_LIBRARY_MIGRATED, true)
+            .putBoolean(KEY_FIRST_DRAFT_REMOVED, true)
+            .putBoolean(KEY_CHROMATIC_REPLACED, true)
             .apply()
-        return migrated
+        return selected
     }
 
     fun saveSelected(ids: Set<String>) {
@@ -119,6 +187,21 @@ class PresetLibrary(private val context: Context) {
             .apply()
     }
 
+    /** Deletes only imported presets. Built-in looks deliberately remain immutable. */
+    fun deleteCustomPreset(preset: Preset) {
+        require(preset.isCustom) { "Nur importierte Filter können gelöscht werden." }
+        File(customDirectory, "${preset.id}.xmp").delete()
+        val recent = prefs.getString(KEY_RECENT, "").orEmpty()
+            .split(',').filter { it.isNotBlank() && it != preset.id }
+        prefs.edit()
+            .remove("$KEY_NAME${preset.id}")
+            .remove("$KEY_INTENSITY${preset.id}")
+            .remove("$KEY_GRAIN${preset.id}")
+            .remove("$KEY_HALATION${preset.id}")
+            .putString(KEY_RECENT, recent.joinToString(","))
+            .apply()
+    }
+
     fun applySavedEdits(preset: Preset): Preset = preset.copy(
         name = prefs.getString("$KEY_NAME${preset.id}", preset.name).orEmpty().ifBlank { preset.name },
         intensity = prefs.getFloat("$KEY_INTENSITY${preset.id}", preset.intensity).coerceIn(0f, 1f),
@@ -142,10 +225,43 @@ class PresetLibrary(private val context: Context) {
         private const val KEY_SELECTED = "selected_ids"
         private const val KEY_RECENT = "recent_ids"
         private const val KEY_NEW_LOOKS_MIGRATED = "new_looks_migrated_v1"
+        private const val KEY_TEN_DEFAULTS_MIGRATED = "ten_default_looks_migrated_v1"
+        private const val KEY_FILM_LIBRARY_MIGRATED = "film_library_migrated_v1"
+        private const val KEY_FIRST_DRAFT_REMOVED = "first_draft_removed_v1"
+        private const val KEY_CHROMATIC_REPLACED = "chromatic_replaced_v1"
+        private val LEGACY_LOOK_IDS = setOf("leica_mono", "teal_orange", "portra_400", "classic_chrome", "warm_fade", "cool_night", "high_contrast", "cinema_green", "soft_rose")
+        private val FIRST_DRAFT_LOOK_IDS = setOf(
+            "carbon_mono", "sunlit", "blue_hour", "amber_35", "pastel_negative",
+            "dusty_slide", "golden_expiry", "motel_flash", "cine_olive", "cine_log",
+            "copper_frame", "sodium_dream", "neon_rain", "velvet_night", "liminal",
+            "electric_bloom", "acid_wash"
+        )
+        private val CHROMATIC_DRAFT_LOOK_IDS = setOf(
+            "amber_grid", "violet_void", "chlorine_dream", "arcade_bleed", "cobalt_pull",
+            "bleach_milk", "ember_skin"
+        )
         private const val KEY_NAME = "name_"
         private const val KEY_INTENSITY = "intensity_"
         private const val KEY_GRAIN = "grain_"
         private const val KEY_HALATION = "halation_"
+        private const val PACKAGED_SODIUM_DIRECTORY = "presets/sodium"
+        private const val PACKAGED_URBAN_DIRECTORY = "presets/urban"
+        private const val PACKAGED_AFTERGLOW_DIRECTORY = "presets/afterglow"
+        private const val PACKAGED_WANDERLIGHT_DIRECTORY = "presets/wanderlight"
+        private val SODIUM_ACCENTS = intArrayOf(
+            android.graphics.Color.parseColor("#D8752A"),
+            android.graphics.Color.parseColor("#B84B7F"),
+            android.graphics.Color.parseColor("#4B83AF"),
+            android.graphics.Color.parseColor("#875BC1"),
+            android.graphics.Color.parseColor("#B98939")
+        )
+        private val COMMUNITY_ACCENTS = intArrayOf(
+            android.graphics.Color.parseColor("#C45D45"),
+            android.graphics.Color.parseColor("#667EB4"),
+            android.graphics.Color.parseColor("#B46A8C"),
+            android.graphics.Color.parseColor("#77986D"),
+            android.graphics.Color.parseColor("#BA914B")
+        )
     }
 }
 

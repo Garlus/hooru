@@ -33,6 +33,7 @@ import android.view.Surface
 import android.view.WindowManager
 import com.purepixel.camera.gl.createPresetColorMatrix
 import com.purepixel.camera.model.LightroomPreset
+import com.purepixel.camera.model.NativePresetProcessor
 import com.purepixel.camera.model.Preset
 import com.purepixel.camera.model.ProcessingMode
 import java.io.File
@@ -43,8 +44,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.Locale
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.log2
 
 class CameraEngine(private val context: Context) {
+    enum class FlashMode { OFF, AUTO, ON }
 
     companion object {
         private const val TAG = "HooruCameraEngine"
@@ -140,6 +143,10 @@ class CameraEngine(private val context: Context) {
     private var manualIso: Int? = null
     private var manualExposureTimeNs: Long? = null
     private var exposureCompensationEv: Float = 0f
+    // Negative-only offset for looks that lift scene brightness after the sensor
+    // exposure has been chosen. It protects highlights without making dark looks
+    // brighten the capture or overriding a deliberately manual exposure.
+    private var filterAutoExposureBiasEv: Float = 0f
     private var activeFilterId: String = "no_filter"
     private var activeLightroomPreset: LightroomPreset? = null
     private var activeLookIntensity: Float = 1f
@@ -150,6 +157,8 @@ class CameraEngine(private val context: Context) {
     var captureFormat: String = "JPG" // "JPG" | "RAW" | "RAW+JPG"
     var currentZoomRatio: Float = 1.0f
     var isFlashEnabled: Boolean = false
+        private set
+    var flashMode: FlashMode = FlashMode.OFF
         private set
     private var minimumZoomRatio: Float = 1.0f
     private var maximumZoomRatio: Float = 1.0f
@@ -401,32 +410,41 @@ class CameraEngine(private val context: Context) {
         updateExposureCapabilities(ExposureCapabilities())
         closeCamera()
         isFlashEnabled = false
+        flashMode = FlashMode.OFF
         val texture = previewSurfaceTexture ?: return
         backgroundHandler?.post {
             openCamera(texture, previewWidth, previewHeight)
         }
     }
 
-    fun toggleFlash(): Boolean {
+    fun cycleFlashMode(): FlashMode {
         val hasFlash = activeCharacteristics?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
-        val builder = previewRequestBuilder ?: return false
-        val session = captureSession ?: return false
+        val builder = previewRequestBuilder ?: return FlashMode.OFF
+        val session = captureSession ?: return FlashMode.OFF
         if (!hasFlash) {
             isFlashEnabled = false
-            return false
+            flashMode = FlashMode.OFF
+            return flashMode
         }
-        isFlashEnabled = !isFlashEnabled
+        flashMode = when (flashMode) {
+            FlashMode.OFF -> FlashMode.AUTO
+            FlashMode.AUTO -> FlashMode.ON
+            FlashMode.ON -> FlashMode.OFF
+        }
+        isFlashEnabled = flashMode == FlashMode.ON
         return try {
+            builder.set(CaptureRequest.FLASH_MODE, if (flashMode == FlashMode.ON) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
             builder.set(
-                CaptureRequest.FLASH_MODE,
-                if (isFlashEnabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF
+                CaptureRequest.CONTROL_AE_MODE,
+                if (flashMode == FlashMode.AUTO) CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH else CaptureRequest.CONTROL_AE_MODE_ON
             )
             session.setRepeatingRequest(builder.build(), null, backgroundHandler)
-            isFlashEnabled
+            flashMode
         } catch (e: Exception) {
             isFlashEnabled = false
+            flashMode = FlashMode.OFF
             Log.e(TAG, "Unable to toggle flash", e)
-            false
+            flashMode
         }
     }
 
@@ -438,6 +456,8 @@ class CameraEngine(private val context: Context) {
         activeLookHalation = preset.halation
         activeProcessingMode = preset.processingMode
         applyProcessingModeToPreview()
+        filterAutoExposureBiasEv = automaticFilterExposureBias(preset)
+        applyExposureControls()
     }
 
     fun setCaptureFilter(presetId: String, lightroomPreset: LightroomPreset? = null) {
@@ -454,6 +474,35 @@ class CameraEngine(private val context: Context) {
             ProcessingMode.HOORU
         }
         applyProcessingModeToPreview()
+        filterAutoExposureBiasEv = automaticFilterExposureBias(
+            Preset(id = presetId, name = presetId, lightroom = lightroomPreset, intensity = 1f, processingMode = activeProcessingMode)
+        )
+        applyExposureControls()
+    }
+
+    /**
+     * Estimates the post-processing light gain in EV before Auto-AE builds its
+     * request. Lightroom's Exposure value is already expressed in EV; built-in
+     * looks are sampled at a bright neutral tone from their capture color matrix.
+     */
+    private fun automaticFilterExposureBias(preset: Preset): Float {
+        if (preset.processingMode != ProcessingMode.HOORU) return 0f
+        preset.lightroom?.let { lightroom ->
+            return (-lightroom.exposure * preset.intensity).coerceIn(-2f, 0f)
+        }
+        val matrix = createPresetColorMatrix(preset.id)?.array ?: return 0f
+        val reference = 0.72f * 255f
+        fun channel(row: Int): Float = (
+            matrix[row] * reference + matrix[row + 1] * reference + matrix[row + 2] * reference + matrix[row + 4]
+        ).coerceIn(0f, 255f)
+        val outputLuminance = (
+            .2126f * channel(0) + .7152f * channel(5) + .0722f * channel(10)
+        ).coerceAtLeast(1f)
+        val gainEv = log2(outputLuminance / reference)
+        // Halation only affects highlights, but reserve a small additional margin
+        // where it can otherwise clip a bright look's already-raised whites.
+        return (-(gainEv.coerceAtLeast(0f) * preset.intensity) - preset.halation * .15f)
+            .coerceIn(-1f, 0f)
     }
 
     private fun applyProcessingModeToPreview() {
@@ -641,7 +690,7 @@ class CameraEngine(private val context: Context) {
             builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
             builder.set(
                 CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
-                (exposureCompensationEv / step).roundToInt().coerceIn(
+                ((exposureCompensationEv + filterAutoExposureBiasEv) / step).roundToInt().coerceIn(
                     compensationRange?.lower ?: 0,
                     compensationRange?.upper ?: 0
                 )
@@ -802,25 +851,37 @@ class CameraEngine(private val context: Context) {
         }
     }
 
+    @Volatile private var pendingZoomRatio: Float? = null
+    @Volatile private var zoomUpdateQueued = false
+
+    /**
+     * Coalesce fast touch updates onto Camera2's handler. This keeps binder work out
+     * of Compose's input path while always applying the most recent finger position.
+     */
     fun setZoomRatio(zoomRatio: Float) {
         val supportedZoom = zoomRatio.coerceIn(minimumZoomRatio, maximumZoomRatio)
         currentZoomRatio = supportedZoom
+        pendingZoomRatio = supportedZoom
+        if (zoomUpdateQueued) return
+        zoomUpdateQueued = true
+        backgroundHandler?.post {
+            while (true) {
+                val nextZoom = pendingZoomRatio ?: break
+                pendingZoomRatio = null
+                applyZoomRatio(nextZoom)
+                if (pendingZoomRatio == null) break
+            }
+            zoomUpdateQueued = false
+            // Cover a new gesture update that arrived while the queue flag was reset.
+            if (pendingZoomRatio != null) setZoomRatio(pendingZoomRatio!!)
+        } ?: run { zoomUpdateQueued = false }
+    }
+
+    private fun applyZoomRatio(supportedZoom: Float) {
         val builder = previewRequestBuilder ?: return
         val session = captureSession ?: return
-
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, supportedZoom)
-            } else {
-                val chars = activeCharacteristics ?: return
-                val sensorRect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
-                val cropWidth = (sensorRect.width() / supportedZoom).toInt()
-                val cropHeight = (sensorRect.height() / supportedZoom).toInt()
-                val left = (sensorRect.width() - cropWidth) / 2
-                val top = (sensorRect.height() - cropHeight) / 2
-                val cropRect = Rect(left, top, left + cropWidth, top + cropHeight)
-                builder.set(CaptureRequest.SCALER_CROP_REGION, cropRect)
-            }
+            applyZoomToRequest(builder, supportedZoom)
             session.setRepeatingRequest(builder.build(), null, backgroundHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Error setting zoom ratio", e)
@@ -991,8 +1052,10 @@ class CameraEngine(private val context: Context) {
             val grainAtCapture = activeLookGrain
             val halationAtCapture = activeLookHalation
             val aspectRatioAtCapture = captureAspectRatio
-            if (isFlashEnabled) {
-                captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
+            when (flashMode) {
+                FlashMode.ON -> captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
+                FlashMode.AUTO -> captureBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
+                FlashMode.OFF -> Unit
             }
 
             // RAW Capture Listener
@@ -1177,18 +1240,14 @@ class CameraEngine(private val context: Context) {
                 working = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     ?: error("Camera JPEG could not be decoded")
                 val source = requireNotNull(working)
-                val rotation = Matrix().apply { postRotate(jpegOrientation.toFloat()) }
-                val oriented = Bitmap.createBitmap(
-                    source, 0, 0, source.width, source.height, rotation, true
+                val orientedAndCropped = orientAndCrop(
+                    source = source,
+                    rotationDegrees = jpegOrientation,
+                    targetWidthOverHeight = aspectRatio
                 )
-                if (oriented !== source) {
+                if (orientedAndCropped !== source) {
                     source.recycle()
-                    working = oriented
-                }
-                val cropped = centerCropToAspect(requireNotNull(working), aspectRatio)
-                if (cropped !== working) {
-                    working?.recycle()
-                    working = cropped
+                    working = orientedAndCropped
                 }
                 filtered = if (lightroomPreset != null) {
                     lightroomPreset.applyToBitmap(requireNotNull(working))
@@ -1219,17 +1278,45 @@ class CameraEngine(private val context: Context) {
         }
     }
 
-    private fun centerCropToAspect(source: Bitmap, targetWidthOverHeight: Float): Bitmap {
-        val target = targetWidthOverHeight.coerceIn(9f / 21f, 1f)
+    private fun orientAndCrop(
+        source: Bitmap,
+        rotationDegrees: Int,
+        targetWidthOverHeight: Float
+    ): Bitmap {
+        val normalizedRotation = ((rotationDegrees % 360) + 360) % 360
+        val targetAfterRotation = targetWidthOverHeight.coerceIn(9f / 21f, 1f)
+        val axesSwap = normalizedRotation == 90 || normalizedRotation == 270
+        val targetBeforeRotation = if (axesSwap) 1f / targetAfterRotation else targetAfterRotation
         val current = source.width.toFloat() / source.height
-        if (kotlin.math.abs(current - target) < .002f) return source
-        return if (current > target) {
-            val width = (source.height * target).roundToInt().coerceAtMost(source.width)
-            Bitmap.createBitmap(source, (source.width - width) / 2, 0, width, source.height)
-        } else {
-            val height = (source.width / target).roundToInt().coerceAtMost(source.height)
-            Bitmap.createBitmap(source, 0, (source.height - height) / 2, source.width, height)
+
+        var cropX = 0
+        var cropY = 0
+        var cropWidth = source.width
+        var cropHeight = source.height
+        if (kotlin.math.abs(current - targetBeforeRotation) >= .002f) {
+            if (current > targetBeforeRotation) {
+                cropWidth = (source.height * targetBeforeRotation).roundToInt().coerceAtMost(source.width)
+                cropX = (source.width - cropWidth) / 2
+            } else {
+                cropHeight = (source.width / targetBeforeRotation).roundToInt().coerceAtMost(source.height)
+                cropY = (source.height - cropHeight) / 2
+            }
         }
+
+        if (normalizedRotation == 0 && cropX == 0 && cropY == 0 &&
+            cropWidth == source.width && cropHeight == source.height
+        ) return source
+
+        val rotation = Matrix().apply { postRotate(normalizedRotation.toFloat()) }
+        return Bitmap.createBitmap(
+            source,
+            cropX,
+            cropY,
+            cropWidth,
+            cropHeight,
+            rotation,
+            true
+        )
     }
 
     private fun finishLook(
@@ -1242,6 +1329,15 @@ class CameraEngine(private val context: Context) {
         val mix = intensity.coerceIn(0f, 1f)
         if (mix >= .999f && grain <= 0f && halation <= 0f) return filtered
         val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+
+        // Keep the second full-resolution pass in native memory. The previous
+        // getPixels -> Kotlin loop -> setPixels path copied tens of megabytes and
+        // processed every pixel on one thread after the LUT had already finished.
+        if (NativePresetProcessor.finishLook(source, filtered, output, mix, grain, halation)) {
+            return output
+        }
+
+        // Portable fallback for devices on which the native library cannot load.
         Canvas(output).apply {
             drawBitmap(source, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG))
             drawBitmap(filtered, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
