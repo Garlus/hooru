@@ -1,3 +1,19 @@
 <resources>
     <string name="app_name">hooru</string>
+    <string name="settings_capture">Aufnahme &amp; Verhalten</string>
+    <string name="settings_exposure_focus">Belichtung &amp; Fokus</string>
+    <string name="settings_composition">Komposition</string>
+    <string name="remember_filter">Letzten Filter merken</string>
+    <string name="remember_filter_description">Beim nächsten Start wieder mit dem zuletzt ausgewählten Filter öffnen</string>
+    <string name="timer">Selbstauslöser</string>
+    <string name="histogram">Histogramm &amp; RGB-Waveform</string>
+    <string name="histogram_description">Belichtungsanalyse über dem Sucher</string>
+    <string name="zebra">Zebra-Streifen</string>
+    <string name="focus_peaking">Fokus-Peaking</string>
+    <string name="focus_peaking_description">Scharfe Kanten markieren</string>
+    <string name="aspect_ratio">Seitenverhältnis</string>
+    <string name="grid">Fotogitter</string>
+    <string name="grid_description">Drittelraster im Sucher</string>
+    <string name="level">Wasserwaage</string>
+    <string name="level_description">Horizontale Ausrichtung im Sucher</string>
 </resources>

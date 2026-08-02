@@ -18,7 +18,8 @@ import com.purepixel.camera.model.LightroomPreset
 class LutShaderRenderer(
     private val onSurfaceReady: (SurfaceTexture) -> Unit,
     private val requestRender: () -> Unit,
-    private val onAnalysis: (PreviewAnalysis) -> Unit = { }
+    private val onAnalysis: (PreviewAnalysis) -> Unit = { },
+    private val onFirstCameraFrame: () -> Unit = { }
 ) : GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
 
     companion object {
@@ -119,7 +120,7 @@ void main() {
         float edgeMask = smoothstep(uSharpenMasking * 0.25, uSharpenMasking * 0.25 + 0.08, edge);
         cameraColor.rgb = denoised + (cameraColor.rgb - soft) * (uSharpness * edgeMask + uClarity * clarityMask);
     }
-    
+
     // Trilinear 3D LUT sampling in OpenGL ES 3.0
     vec3 graded = texture(uLutTexture3D, clamp(cameraColor.rgb, 0.0, 1.0)).rgb;
     vec3 lutColor = mix(cameraColor.rgb, graded, step(0.5, uEnableLut) * uIntensity);
@@ -243,6 +244,7 @@ void main() {
     private var updateSurface = false
     @Volatile private var lastFrameCallbackNanos = 0L
     private var textureUnavailableLogged = false
+    private var firstCameraFrameReported = false
 
     @Volatile
     var isLutEnabled = false // Default to No Filter (bypassed)
@@ -372,12 +374,14 @@ void main() {
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        var consumedCameraFrame = false
         synchronized(this) {
             if (updateSurface) {
                 try {
                     surfaceTexture?.updateTexImage()
                     surfaceTexture?.getTransformMatrix(stMatrix)
                     textureUnavailableLogged = false
+                    consumedCameraFrame = true
                 } catch (e: RuntimeException) {
                     if (!textureUnavailableLogged) {
                         Log.w(TAG, "Camera texture was temporarily unavailable", e)
@@ -423,6 +427,10 @@ void main() {
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glBindVertexArray(0)
         collectPreviewAnalysis()
+        if (consumedCameraFrame && !firstCameraFrameReported) {
+            firstCameraFrameReported = true
+            onFirstCameraFrame()
+        }
     }
 
     override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {

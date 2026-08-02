@@ -78,6 +78,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.SpanStyle
@@ -92,6 +93,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.purepixel.camera.camera.CameraEngine
+import com.purepixel.camera.R
 import com.purepixel.camera.gl.CameraPreviewGL
 import com.purepixel.camera.gl.GLCameraView
 import com.purepixel.camera.gl.PreviewAnalysis
@@ -209,6 +211,7 @@ private fun Modifier.springClickable(
 @Composable
 fun PurePixelScreen(
     cameraEngine: CameraEngine,
+    onFirstPreviewFrame: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -225,6 +228,7 @@ fun PurePixelScreen(
     var exposureCapabilities by remember { mutableStateOf(cameraEngine.exposureCapabilities) }
     var rawCaptureSupported by remember { mutableStateOf(cameraEngine.supportsRawCapture) }
     var glView by remember { mutableStateOf<GLCameraView?>(null) }
+    var firstPreviewReady by remember { mutableStateOf(false) }
     var backgroundFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var flashMode by remember { mutableStateOf(CameraEngine.FlashMode.OFF) }
     var manualIso by remember { mutableStateOf<Int?>(null) }
@@ -237,8 +241,10 @@ fun PurePixelScreen(
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var focusSequence by remember { mutableIntStateOf(0) }
 
-    var builtInPresets by remember { mutableStateOf(presetLibrary.builtInPresets()) }
-    var customPresets by remember { mutableStateOf(presetLibrary.customPresets()) }
+    // Keep first composition cheap. Parsing the packaged XMP library and scanning
+    // imported files is deferred until the camera has delivered its first frame.
+    var builtInPresets by remember { mutableStateOf(presetLibrary.startupPresets()) }
+    var customPresets by remember { mutableStateOf(emptyList<Preset>()) }
     var rememberLastFilter by remember {
         mutableStateOf(cameraSettings.getBoolean("remember_last_filter", false))
     }
@@ -255,14 +261,16 @@ fun PurePixelScreen(
     var presets by remember {
         mutableStateOf(buildShutterPresets(builtInPresets, customPresets, selectedPresetIds))
     }
-    var activePresetIndex by remember {
-        val initialPresetId = if (cameraSettings.getBoolean("remember_last_filter", false)) {
+    val startupPresetId = remember {
+        if (cameraSettings.getBoolean("remember_last_filter", false)) {
             cameraSettings.getString("last_filter_id", "no_filter") ?: "no_filter"
         } else {
             "no_filter"
         }
+    }
+    var activePresetIndex by remember {
         mutableIntStateOf(
-            presets.indexOfFirst { it.id == initialPresetId }
+            presets.indexOfFirst { it.id == startupPresetId }
                 .takeIf { it >= 0 }
                 ?: presets.indexOfFirst { it.id == "no_filter" }.coerceAtLeast(0)
         )
@@ -421,6 +429,34 @@ fun PurePixelScreen(
         }
     }
 
+    LaunchedEffect(firstPreviewReady) {
+        if (!firstPreviewReady) return@LaunchedEffect
+        // Camera startup owns the critical path. Only after its first frame do we
+        // scan imported files and parse the 37 packaged Lightroom XMP presets.
+        delay(120L)
+        val (loadedBuiltIns, loadedCustom) = withContext(Dispatchers.IO) {
+            presetLibrary.builtInPresets() to presetLibrary.customPresets()
+        }
+        val currentActiveId = presets.getOrNull(activePresetIndex)?.id ?: "no_filter"
+        val targetActiveId = if (filterInteractionCounter == 0 && rememberLastFilter) {
+            startupPresetId
+        } else {
+            currentActiveId
+        }
+        val loadedShutterPresets = buildShutterPresets(
+            loadedBuiltIns,
+            loadedCustom,
+            selectedPresetIds
+        )
+        builtInPresets = loadedBuiltIns
+        customPresets = loadedCustom
+        presets = loadedShutterPresets
+        activePresetIndex = loadedShutterPresets.indexOfFirst { it.id == targetActiveId }
+            .takeIf { it >= 0 }
+            ?: loadedShutterPresets.indexOfFirst { it.id == "no_filter" }.coerceAtLeast(0)
+        pendingPresetIndex = activePresetIndex
+    }
+
     LaunchedEffect(gallerySaveState.savedRevision) {
         if (gallerySaveState.savedRevision > 0) {
             galleryThumbnail = withContext(Dispatchers.IO) {
@@ -439,7 +475,9 @@ fun PurePixelScreen(
     }
 
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(firstPreviewReady) {
+        if (!firstPreviewReady) return@LaunchedEffect
+        delay(220L)
         galleryThumbnail = withContext(Dispatchers.IO) {
             cameraEngine.loadLatestGalleryThumbnail()
         }?.asImageBitmap()
@@ -538,14 +576,18 @@ fun PurePixelScreen(
     // Warm the small card bitmaps and the live-preview LUTs before the filter book
     // is opened. Both paths run off the main thread, so the first page turn does
     // not have to pay the one-time rendering cost.
-    LaunchedEffect(presets) {
+    LaunchedEffect(presets, firstPreviewReady) {
+        if (!firstPreviewReady) return@LaunchedEffect
+        delay(300L)
         presets.asSequence()
             .filterNot(Preset::isAddButton)
             .take(10)
             .forEach { previewCache.preview(it) }
     }
 
-    LaunchedEffect(glView, presets) {
+    LaunchedEffect(glView, presets, firstPreviewReady) {
+        if (!firstPreviewReady) return@LaunchedEffect
+        delay(300L)
         glView?.preloadPresets(
             presets.asSequence()
                 .filterNot(Preset::isAddButton)
@@ -722,6 +764,10 @@ fun PurePixelScreen(
                         applyPresetToPreview(view, activePreset)
                         cameraEngine.setCaptureFilter(activePreset)
                     },
+                    onFirstPreviewFrame = {
+                        firstPreviewReady = true
+                        onFirstPreviewFrame()
+                    },
                     onPreviewFrame = { bitmap ->
                         backgroundFrame = bitmap.asImageBitmap()
                     },
@@ -868,17 +914,11 @@ fun PurePixelScreen(
                     },
                 contentAlignment = Alignment.Center
             ) {
-                AnimatedContent(
-                    targetState = uiMode == UiStateMode.FILTER_ACTIVE,
-                    transitionSpec = {
-                        // Both states contain opaque controls. Crossfading them briefly
-                        // exposed the old control shelf as a black block under the cards.
-                        fadeIn(tween(80)).togetherWith(fadeOut(tween(0)))
-                    },
-                    contentAlignment = Alignment.Center,
-                    label = "filterBookTransition"
-                ) { filterActive ->
-                    if (filterActive) {
+                // Never keep the idle shelf and the filter book in the composition at
+                // the same time. AnimatedContent briefly retained its outgoing layer,
+                // which allowed the black shutter surface to cover the cards at both
+                // ends of the transition.
+                if (uiMode == UiStateMode.FILTER_ACTIVE) {
                         FilterCarouselRow(
                             presets = presets,
                             selectedIndex = pendingPresetIndex,
@@ -898,7 +938,7 @@ fun PurePixelScreen(
                                 }
                             }
                         )
-                    } else {
+                } else {
                         // IDLE & ZOOM MODE (Image 1 & 3): Telemetry Bar on EXACT SAME HEIGHT as Shutter
                         IdleTelemetryShutterRow(
                             shutterPressed = shutterPressed,
@@ -943,7 +983,6 @@ fun PurePixelScreen(
                                 // Replaced by press-and-hold selection.
                             }
                         )
-                    }
                 }
             }
 
@@ -1072,7 +1111,11 @@ fun PurePixelScreen(
         ) {
             Surface(Modifier.fillMaxSize(), color = PanelBlack, contentColor = Color.White) {
                 Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-                    LibraryHeader(title = "Filter", onClose = { showPresetSheet = false })
+                    LibraryHeader(
+                        title = "Filter",
+                        selectedCount = activeFilterCount(selectedPresetIds),
+                        onClose = { showPresetSheet = false }
+                    )
                     PresetLibrarySheet(
                         modifier = Modifier.weight(1f),
                         signatureLooks = presetLibrary.signatureLooks,
@@ -1236,29 +1279,6 @@ private fun PresetLibrarySheet(
             .padding(horizontal = 18.dp, vertical = 20.dp),
         verticalArrangement = Arrangement.spacedBy(24.dp)
     ) {
-        SettingsSection(
-            title = "Aktive Filter",
-            description = "Diese Looks erscheinen in der Kamera-Auswahl"
-        ) {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("${activeFilterCount(selectedIds)} von $MaxActiveFilters ausgewählt", color = Color.White.copy(alpha = .72f), style = MaterialTheme.typography.bodyMedium)
-                Surface(shape = RoundedCornerShape(10.dp), color = Color.White.copy(alpha = .08f)) {
-                    Text(
-                        "${activeFilterCount(selectedIds)}/$MaxActiveFilters",
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                        maxLines = 1,
-                        softWrap = false,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = QuietWhite
-                    )
-                }
-            }
-            Text(
-                "Antippen zum Aktivieren · lange halten zum Bearbeiten",
-                color = Color.White.copy(alpha = .58f),
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
         PresetSection("Signature & Clean", signatureLooks, selectedIds, previewCache, onToggle, onEdit, description = "Kuratierte Signature- und Clean-Looks")
         PresetCategory.entries.filter { it != PresetCategory.ESSENTIALS }.forEach { category ->
             PresetSection(
@@ -1285,7 +1305,7 @@ private fun PresetLibrarySheet(
 }
 
 @Composable
-private fun LibraryHeader(title: String, onClose: () -> Unit) {
+private fun LibraryHeader(title: String, selectedCount: Int, onClose: () -> Unit) {
     Column {
         Row(
             modifier = Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 8.dp),
@@ -1295,6 +1315,20 @@ private fun LibraryHeader(title: String, onClose: () -> Unit) {
                 Text("‹", fontSize = 34.sp, fontWeight = FontWeight.Light, color = QuietWhite)
             }
             Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.weight(1f))
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = Color.Transparent,
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = .55f))
+            ) {
+                Text(
+                    "$selectedCount/$MaxActiveFilters",
+                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
         HorizontalDivider(color = Hairline, thickness = 1.dp)
     }
@@ -1328,42 +1362,37 @@ private fun CameraSettingsSheet(
         verticalArrangement = Arrangement.spacedBy(24.dp)
     ) {
         SettingsSection(
-            title = "Aufnahme & Verhalten",
+            title = stringResource(R.string.settings_capture),
             description = "Auslöser, Startverhalten und persönliche Vorgaben"
         ) {
             SettingSwitch(
-                "Letzten Filter merken",
-                "Beim nächsten Start wieder mit dem zuletzt ausgewählten Filter öffnen",
-                rememberLastFilter,
-                onRememberLastFilterChange
+                title = stringResource(R.string.remember_filter),
+                description = "",
+                checked = rememberLastFilter,
+                onCheckedChange = onRememberLastFilterChange
             )
             SettingsDivider()
-            SettingGroup("Selbstauslöser") {
+            SettingGroup(stringResource(R.string.timer)) {
                 SegmentedSelector(
                     options = listOf(0 to "Aus", 3 to "3 s", 10 to "10 s"),
                     selected = timerSeconds,
                     onSelected = onTimerChange
                 )
             }
-            Text(
-                "Die Lautstärketasten lösen die Kamera ebenfalls aus und verwenden den gewählten Timer.",
-                color = Color.White.copy(alpha = .48f),
-                style = MaterialTheme.typography.bodySmall
-            )
         }
 
         SettingsSection(
-            title = "Belichtung & Fokus",
+            title = stringResource(R.string.settings_exposure_focus),
             description = "Werkzeuge zur technischen Bildkontrolle"
         ) {
             SettingSwitch(
-                "Histogramm & RGB-Waveform",
-                "Belichtungsanalyse oberhalb des Suchers anzeigen",
+                stringResource(R.string.histogram),
+                stringResource(R.string.histogram_description),
                 analysisEnabled,
                 onAnalysisEnabledChange
             )
             SettingsDivider()
-            SettingGroup("Zebra-Streifen") {
+            SettingGroup(stringResource(R.string.zebra)) {
                 SegmentedSelector(
                     options = listOf(0 to "Aus", 1 to "Leicht", 2 to "Intensiv"),
                     selected = zebraMode,
@@ -1372,18 +1401,18 @@ private fun CameraSettingsSheet(
             }
             SettingsDivider()
             SettingSwitch(
-                "Fokus Peaking",
-                "Markiert scharfe Kanten rot",
+                stringResource(R.string.focus_peaking),
+                stringResource(R.string.focus_peaking_description),
                 focusPeakingEnabled,
                 onFocusPeakingChange
             )
         }
 
         SettingsSection(
-            title = "Komposition",
+            title = stringResource(R.string.settings_composition),
             description = "Ausschnitt, Raster und Ausrichtung"
         ) {
-            SettingGroup("Seitenverhältnis") {
+            SettingGroup(stringResource(R.string.aspect_ratio)) {
                 SegmentedSelector(
                     options = listOf(
                         3f / 4f to "4:3",
@@ -1397,9 +1426,9 @@ private fun CameraSettingsSheet(
                 )
             }
             SettingsDivider()
-            SettingSwitch("Fotogitter", "Drittelraster im Sucher", gridEnabled, onGridChange)
+            SettingSwitch(stringResource(R.string.grid), stringResource(R.string.grid_description), gridEnabled, onGridChange)
             SettingsDivider()
-            SettingSwitch("Wasserwaage", "Horizontale Ausrichtung im Sucher", levelEnabled, onLevelChange)
+            SettingSwitch(stringResource(R.string.level), stringResource(R.string.level_description), levelEnabled, onLevelChange)
         }
         Spacer(Modifier.height(4.dp))
     }
@@ -1411,28 +1440,23 @@ private fun SettingsSection(
     description: String,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Column(modifier = Modifier.padding(horizontal = 4.dp)) {
             Text(
                 title,
-                style = MaterialTheme.typography.titleMedium,
+                style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.SemiBold,
-                color = Color.White
-            )
-            Text(
-                description,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.White.copy(alpha = .48f)
+                color = Color.White.copy(alpha = .78f)
             )
         }
         Surface(
-            shape = RoundedCornerShape(3.dp),
+            shape = RoundedCornerShape(18.dp),
             color = RaisedBlack,
             border = androidx.compose.foundation.BorderStroke(1.dp, Hairline)
         ) {
             Column(
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
+                modifier = Modifier.fillMaxWidth().padding(17.dp),
+                verticalArrangement = Arrangement.spacedBy(13.dp),
                 content = content
             )
         }
@@ -1447,7 +1471,7 @@ private fun SettingsDivider() {
 @Composable
 private fun SettingGroup(title: String, content: @Composable () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(title, style = MaterialTheme.typography.titleSmall, color = Color.White.copy(alpha = .72f))
+        Text(title, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = .62f))
         content()
     }
 }
@@ -1455,7 +1479,7 @@ private fun SettingGroup(title: String, content: @Composable () -> Unit) {
 @Composable
 private fun SettingSwitch(
     title: String,
-    description: String,
+    description: String = "",
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
@@ -1465,8 +1489,10 @@ private fun SettingSwitch(
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.Medium)
-            Text(description, color = Color.White.copy(alpha = .5f), style = MaterialTheme.typography.bodySmall)
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Normal, color = Color.White.copy(alpha = .9f))
+            if (description.isNotBlank()) {
+                Text(description, color = Color.White.copy(alpha = .43f), style = MaterialTheme.typography.bodySmall)
+            }
         }
         Switch(
             checked = checked,
@@ -1491,21 +1517,21 @@ private fun <T> SegmentedSelector(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(3.dp))
+            .clip(RoundedCornerShape(14.dp))
             .background(Color.Black.copy(alpha = .36f))
-            .border(1.dp, Hairline, RoundedCornerShape(3.dp))
+            .border(1.dp, Hairline, RoundedCornerShape(14.dp))
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp)
     ) {
         options.forEach { (value, label) ->
             val active = value == selected
-            val background by animateColorAsState(if (active) QuietWhite else Color.Transparent, tween(160), label = "selectionSignal-$label")
-            val textColor by animateColorAsState(if (active) Color.Black else Color.White.copy(alpha = .72f), tween(160), label = "selectionText-$label")
+            val borderColor by animateColorAsState(if (active) Color.White else Color.Transparent, tween(160), label = "selectionBorder-$label")
+            val textColor by animateColorAsState(if (active) Color.White else Color.White.copy(alpha = .62f), tween(160), label = "selectionText-$label")
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(background)
+                    .clip(RoundedCornerShape(11.dp))
+                    .border(1.dp, borderColor, RoundedCornerShape(11.dp))
                     .clickable { onSelected(value) }
                     .padding(horizontal = 4.dp, vertical = 9.dp),
                 contentAlignment = Alignment.Center
@@ -1613,13 +1639,10 @@ private fun PresetSection(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(9.dp), modifier = Modifier.animateContentSize()) {
         Column(modifier = Modifier.padding(horizontal = 4.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            if (description.isNotBlank()) {
-                Text(description, style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = .48f))
-            }
+            Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
         }
         Surface(
-            shape = RoundedCornerShape(3.dp),
+            shape = RoundedCornerShape(18.dp),
             color = RaisedBlack,
             border = androidx.compose.foundation.BorderStroke(1.dp, Hairline)
         ) {
@@ -1883,17 +1906,6 @@ private fun <T> VerticalCameraWheel(
     val latestIndex by rememberUpdatedState(selectedIndex)
     var accumulatedDrag by remember { mutableFloatStateOf(0f) }
     var dragging by remember { mutableStateOf(false) }
-    var previousTelemetryValue by remember { mutableStateOf(selectedValue) }
-    val telemetryPulse = remember { Animatable(0f) }
-
-    // Camera-driven changes get a small optical pulse, distinct from manual drag feedback.
-    LaunchedEffect(selectedValue, manual) {
-        if (!manual && selectedValue != previousTelemetryValue) {
-            telemetryPulse.snapTo(1f)
-            telemetryPulse.animateTo(0f, tween(durationMillis = 360))
-        }
-        previousTelemetryValue = selectedValue
-    }
     val draggableState = rememberDraggableState { delta ->
         accumulatedDrag += delta
         val threshold = 17f
@@ -1917,11 +1929,7 @@ private fun <T> VerticalCameraWheel(
         label = "wheelBorder-$label"
     )
     val backgroundColor by animateColorAsState(
-        targetValue = when {
-            dragging -> Color.White.copy(alpha = .09f)
-            telemetryPulse.value > .02f -> Color.White.copy(alpha = .035f + telemetryPulse.value * .07f)
-            else -> Color.White.copy(alpha = .035f)
-        },
+        targetValue = if (dragging) Color.White.copy(alpha = .09f) else Color.White.copy(alpha = .035f),
         animationSpec = tween(140),
         label = "wheelBackground-$label"
     )
@@ -1935,10 +1943,8 @@ private fun <T> VerticalCameraWheel(
         modifier = modifier
             .padding(horizontal = 3.dp)
             .graphicsLayer {
-                val liveLift = telemetryPulse.value * .018f
-                scaleX = interactionScale + liveLift
-                scaleY = interactionScale + liveLift
-                translationY = -telemetryPulse.value * 1.5f
+                scaleX = interactionScale
+                scaleY = interactionScale
             }
             .clip(RoundedCornerShape(11.dp))
             .border(1.dp, borderColor, RoundedCornerShape(11.dp))
@@ -1998,19 +2004,6 @@ private fun <T> VerticalCameraWheel(
                         .fillMaxWidth(),
                     contentAlignment = Alignment.Center
                 ) {
-                    if (label.isNotBlank()) {
-                        Text(
-                            text = label,
-                            color = Color.White.copy(alpha = if (enabled) .38f else .2f),
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 6.sp,
-                            maxLines = 1,
-                            modifier = Modifier
-                                .align(Alignment.CenterStart)
-                                .padding(start = 3.dp)
-                        )
-                    }
                     Text(
                         text = formatter(centreValue),
                         color = when {
@@ -2025,19 +2018,6 @@ private fun <T> VerticalCameraWheel(
                         textAlign = TextAlign.Center,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    // A blurred duplicate gives live sensor changes a restrained, optical glow.
-                    if (!manual && telemetryPulse.value > .01f) {
-                        Text(
-                            text = formatter(centreValue),
-                            color = QuietWhite.copy(alpha = telemetryPulse.value * .48f),
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 10.sp,
-                            maxLines = 1,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth().blur(4.dp)
-                        )
-                    }
                 }
                 TelemetryWheelValue(
                     text = safeIndex.takeIf { it < values.lastIndex }?.let { formatter(values[it + 1]) } ?: " ",
@@ -2046,6 +2026,17 @@ private fun <T> VerticalCameraWheel(
                     modifier = Modifier.weight(1f)
                 )
             }
+        }
+        if (label.isNotBlank()) {
+            Text(
+                text = label,
+                color = Color.White.copy(alpha = if (enabled) .38f else .2f),
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 6.sp,
+                maxLines = 1,
+                modifier = Modifier.align(Alignment.CenterStart).padding(start = 6.dp)
+            )
         }
     }
 }
@@ -2199,7 +2190,7 @@ fun IdleTelemetryShutterRow(
                             CameraEngine.FlashMode.AUTO -> "Blitz automatisch"
                             CameraEngine.FlashMode.ON -> "Blitz an"
                         },
-                        tint = if (mode == CameraEngine.FlashMode.ON) accentColor else Color.White.copy(alpha = .76f),
+                        tint = if (mode == CameraEngine.FlashMode.ON) accentColor else Color.White,
                         modifier = Modifier.size(23.dp)
                     )
                 }
@@ -2343,19 +2334,15 @@ fun FilterCarouselRow(
     onSelectPreset: (Int) -> Unit
 ) {
     if (presets.isEmpty()) return
-    val carouselJiggle = remember { Animatable(0f) }
-    var previousIndex by remember { mutableIntStateOf(selectedIndex) }
-
-    // The stack reacts as one physical bundle first, then every card settles on
-    // its own spring. This makes fast swipes feel tactile without becoming noisy.
+    // One shared position drives every visible page. Reading this Animatable from
+    // graphicsLayer invalidates only drawing/layer properties instead of recomposing
+    // and remeasuring up to eleven independently animated cards on every frame.
+    val selectionPosition = remember { Animatable(selectedIndex.toFloat()) }
     LaunchedEffect(selectedIndex) {
-        val direction = if (selectedIndex >= previousIndex) 1f else -1f
-        if (selectedIndex != previousIndex) {
-            carouselJiggle.snapTo(-direction * 9f)
-            carouselJiggle.animateTo(direction * 4.5f, spring(dampingRatio = .34f, stiffness = 760f))
-            carouselJiggle.animateTo(0f, spring(dampingRatio = .54f, stiffness = 420f))
-        }
-        previousIndex = selectedIndex
+        selectionPosition.animateTo(
+            targetValue = selectedIndex.toFloat(),
+            animationSpec = spring(dampingRatio = .72f, stiffness = 620f)
+        )
     }
 
     Box(
@@ -2375,96 +2362,73 @@ fun FilterCarouselRow(
                 relativeIndex > 0 -> 1f
                 else -> 0f
             }
-
-            // Cards deliberately overlap like bound pages. The quadratic vertical
-            // offset creates the high spine in the center and the bowed outer edges.
-            val targetX = (relativeIndex * 37).dp
-            val targetY = when (distance) {
-                0 -> 0.dp
-                1 -> 7.dp
-                2 -> 16.dp
-                3 -> 25.dp
-                else -> 31.dp
-            }
-            val targetRotation = when (distance) {
-                0 -> 0f
-                // The pages nearest the spine tilt inward as if being lifted.
-                1 -> -direction * 10.5f
-                else -> direction * (3.5f + distance.coerceAtMost(5) * .65f)
-            }
             val targetPageLift = when (distance) {
                 0 -> 0f
                 1 -> -direction * 22f
                 2 -> -direction * 9f
                 else -> 0f
             }
-            val targetScale = when (distance) {
-                0 -> if (shutterPressed) 1.16f else 1.11f
-                1 -> .96f
-                2 -> .9f
-                else -> .84f
-            }
-            val targetAlpha = when {
-                distance <= 3 -> 1f
-                distance == 4 -> .82f
-                distance == 5 -> .55f
-                else -> 0f
-            }
-
-            val x by animateDpAsState(
-                targetValue = targetX,
-                animationSpec = spring(dampingRatio = .7f, stiffness = 470f),
-                label = "filterPageX-$index"
-            )
-            val y by animateDpAsState(
-                targetValue = targetY,
-                animationSpec = spring(dampingRatio = .66f, stiffness = 420f),
-                label = "filterPageY-$index"
-            )
-            val rotation by animateFloatAsState(
-                targetValue = targetRotation,
-                animationSpec = spring(dampingRatio = .56f, stiffness = 360f),
-                label = "filterPageRotation-$index"
-            )
-            val pageLift by animateFloatAsState(
-                targetValue = targetPageLift,
-                animationSpec = spring(dampingRatio = .58f, stiffness = 390f),
-                label = "filterPageLift-$index"
-            )
-            val pageScale by animateFloatAsState(
-                targetValue = targetScale,
-                animationSpec = spring(dampingRatio = .58f, stiffness = 430f),
-                label = "filterPageScale-$index"
-            )
-            val pageAlpha by animateFloatAsState(
-                targetValue = targetAlpha,
-                animationSpec = tween(180),
-                label = "filterPageAlpha-$index"
-            )
-            val lightAngle = pageLift + carouselJiggle.value * (if (index % 2 == 0) 1f else -1f)
 
             PolaroidFilterCard(
                 preset = preset,
                 selected = distance == 0,
                 previewCache = previewCache,
-                lightAngle = lightAngle,
+                lightAngle = targetPageLift,
                 depth = distance,
                 onClick = { onSelectPreset(index) },
                 modifier = Modifier
-                    .offset(x = x, y = y)
                     .zIndex(20f - distance)
                     .graphicsLayer {
-                        scaleX = pageScale
-                        scaleY = pageScale
-                        // Alternating rotation gives adjacent pages a small, paper-like jiggle.
-                        rotationZ = rotation + carouselJiggle.value * (if (index % 2 == 0) .62f else -.62f)
-                        rotationY = pageLift
-                        rotationX = if (distance == 0) -1.8f else direction * 1.4f
-                        // The impulse is independent of stack depth: every visible page
-                        // wiggles by the same amount, even at the far end of the chain.
-                        translationX = carouselJiggle.value
+                        val relative = index - selectionPosition.value
+                        val animatedDistance = abs(relative)
+                        val animatedDirection = when {
+                            relative < 0f -> -1f
+                            relative > 0f -> 1f
+                            else -> 0f
+                        }
+                        val curvedY = when {
+                            animatedDistance <= 1f -> animatedDistance * 7f
+                            animatedDistance <= 2f -> 7f + (animatedDistance - 1f) * 9f
+                            animatedDistance <= 3f -> 16f + (animatedDistance - 2f) * 9f
+                            else -> 25f + (animatedDistance - 3f).coerceAtMost(1f) * 6f
+                        }
+                        val animatedScale = when {
+                            animatedDistance <= 1f ->
+                                1.11f + (.96f - 1.11f) * animatedDistance
+                            animatedDistance <= 2f ->
+                                .96f + (.9f - .96f) * (animatedDistance - 1f)
+                            animatedDistance <= 3f ->
+                                .9f + (.84f - .9f) * (animatedDistance - 2f)
+                            else -> .84f
+                        } * if (shutterPressed && animatedDistance < .5f) 1.045f else 1f
+                        val animatedAlpha = when {
+                            animatedDistance <= 3f -> 1f
+                            animatedDistance <= 4f -> 1f - .18f * (animatedDistance - 3f)
+                            else -> .82f - .27f * (animatedDistance - 4f).coerceAtMost(1f)
+                        }
+                        val animatedRotation = when {
+                            animatedDistance < .02f -> 0f
+                            animatedDistance <= 1f -> -animatedDirection * 10.5f * animatedDistance
+                            else -> animatedDirection * (3.5f + animatedDistance.coerceAtMost(5f) * .65f)
+                        }
+                        val animatedLift = when {
+                            animatedDistance <= 1f -> -animatedDirection * 22f * animatedDistance
+                            animatedDistance <= 2f ->
+                                -animatedDirection * (22f - 13f * (animatedDistance - 1f))
+                            animatedDistance <= 3f ->
+                                -animatedDirection * 9f * (3f - animatedDistance)
+                            else -> 0f
+                        }
+
+                        translationX = relative * 37.dp.toPx()
+                        translationY = curvedY.dp.toPx()
+                        scaleX = animatedScale
+                        scaleY = animatedScale
+                        rotationZ = animatedRotation
+                        rotationY = animatedLift
+                        rotationX = if (animatedDistance < .5f) -1.8f else animatedDirection * 1.4f
                         cameraDistance = 18f * density
-                        alpha = pageAlpha
+                        alpha = animatedAlpha.coerceIn(0f, 1f)
                     }
             )
         }

@@ -16,11 +16,13 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.hardware.SensorManager
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.hardware.camera2.params.MeteringRectangle
 import android.media.ImageReader
 import android.media.MediaScannerConnection
+import android.media.ExifInterface
 import android.provider.MediaStore
 import android.os.Build
 import android.os.Environment
@@ -30,13 +32,16 @@ import android.os.Looper
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import android.view.OrientationEventListener
 import android.view.WindowManager
+import androidx.core.content.FileProvider
 import com.purepixel.camera.gl.createPresetColorMatrix
 import com.purepixel.camera.model.LightroomPreset
 import com.purepixel.camera.model.NativePresetProcessor
 import com.purepixel.camera.model.Preset
 import com.purepixel.camera.model.ProcessingMode
 import java.io.File
+import java.io.ByteArrayInputStream
 import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.concurrent.Executors
@@ -45,6 +50,8 @@ import java.util.Locale
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.log2
+
+private const val CameraRelativePath = "DCIM/Camera/"
 
 class CameraEngine(private val context: Context) {
     enum class FlashMode { OFF, AUTO, ON }
@@ -166,6 +173,16 @@ class CameraEngine(private val context: Context) {
     @Volatile private var previewStreamPaused: Boolean = false
     @Volatile private var cameraOpening: Boolean = false
     private var cameraGeneration: Int = 0
+    // The activity is deliberately portrait-locked, so Display.rotation stays at
+    // ROTATION_0 even when the photographer turns the phone. Track the physical
+    // orientation separately and snapshot it for every still capture.
+    @Volatile private var deviceOrientationDegrees: Int = 0
+    private val orientationListener = object : OrientationEventListener(context, SensorManager.SENSOR_DELAY_NORMAL) {
+        override fun onOrientationChanged(orientation: Int) {
+            if (orientation == ORIENTATION_UNKNOWN) return
+            deviceOrientationDegrees = ((orientation + 45) / 90 * 90) % 360
+        }
+    }
 
     private fun updateRawCapability(supported: Boolean) {
         supportsRawCapture = supported
@@ -217,10 +234,22 @@ class CameraEngine(private val context: Context) {
         }
     }
 
+    fun startOrientationTracking() = orientationListener.enable()
+
+    fun stopOrientationTracking() = orientationListener.disable()
+
     @SuppressLint("MissingPermission")
     @Synchronized
     fun openCamera(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
         if (surfaceTexture.isReleased) return
+        val cameraHandler = backgroundHandler ?: return
+        if (Looper.myLooper() !== cameraHandler.looper) {
+            // SurfaceTexture is published by GLSurfaceView's GL thread. Camera
+            // discovery, characteristics and ImageReader allocation must not hold
+            // that thread up while it finishes the first visible frame.
+            cameraHandler.post { openCamera(surfaceTexture, width, height) }
+            return
+        }
         val surfaceChanged = previewSurfaceTexture !== surfaceTexture
         previewSurfaceTexture = surfaceTexture
         previewWidth = width
@@ -726,14 +755,23 @@ class CameraEngine(private val context: Context) {
     fun openNativeGallery(): Boolean {
         try {
             val latest = findLatestHooruImageUri() ?: return false
+            val googlePhotosIntent = Intent(Intent.ACTION_VIEW, latest).apply {
+                setDataAndType(latest, "image/*")
+                setPackage("com.google.android.apps.photos")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
             val reviewIntent = Intent("com.android.camera.action.REVIEW", latest).apply {
                 setDataAndType(latest, "image/*")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val intent = if (reviewIntent.resolveActivity(context.packageManager) != null) reviewIntent else {
+            val intent = when {
+                googlePhotosIntent.resolveActivity(context.packageManager) != null -> googlePhotosIntent
+                reviewIntent.resolveActivity(context.packageManager) != null -> reviewIntent
+                else -> {
                 Intent(Intent.ACTION_VIEW, latest).apply {
                     setDataAndType(latest, "image/*")
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
                 }
             }
             context.startActivity(intent)
@@ -766,19 +804,35 @@ class CameraEngine(private val context: Context) {
     }
 
     private fun findLatestHooruImageUri(): Uri? {
+        // Android 9 stores captures in this app's external-media directory. Reading
+        // that directory does not require the legacy broad storage permissions.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            val latestFile = getOutputDirectory()
+                .listFiles { file ->
+                    file.isFile && file.name.startsWith("hooru_") &&
+                        file.extension.equals("jpg", ignoreCase = true)
+                }
+                ?.maxByOrNull(File::lastModified)
+                ?: return null
+            return FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.files",
+                latestFile
+            )
+        }
+
         val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         val selection = buildString {
             append("${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?")
             append(" AND ${MediaStore.Images.Media.SIZE} > 0")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                append(" AND ${MediaStore.Images.Media.IS_PENDING} = 0")
-            }
+            append(" AND ${MediaStore.Images.Media.IS_PENDING} = 0")
+            append(" AND ${MediaStore.Images.Media.RELATIVE_PATH} = ?")
         }
         return context.contentResolver.query(
             collection,
             arrayOf(MediaStore.Images.Media._ID),
             selection,
-            arrayOf("hooru_%"),
+            arrayOf("hooru_%", CameraRelativePath),
             "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
         )?.use { cursor ->
             if (!cursor.moveToFirst()) null else {
@@ -1171,7 +1225,7 @@ class CameraEngine(private val context: Context) {
                 val values = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
                     put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/Hooru")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, CameraRelativePath)
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
                 pendingUri = context.contentResolver.insert(
@@ -1242,7 +1296,14 @@ class CameraEngine(private val context: Context) {
                 val source = requireNotNull(working)
                 val orientedAndCropped = orientAndCrop(
                     source = source,
-                    rotationDegrees = jpegOrientation,
+                    // Most HALs expose the requested JPEG orientation as EXIF.
+                    // A few omit that tag on the byte stream sent to ImageReader;
+                    // then query the sensor again here, immediately before the
+                    // gallery file is rendered. This also covers a rotation in the
+                    // short interval between shutter press and image processing.
+                    rotationDegrees = jpegExifRotationDegrees(bytes)
+                        .takeIf { it != 0 }
+                        ?: calculateJpegOrientation(),
                     targetWidthOverHeight = aspectRatio
                 )
                 if (orientedAndCropped !== source) {
@@ -1277,6 +1338,18 @@ class CameraEngine(private val context: Context) {
             working?.takeIf { !it.isRecycled }?.recycle()
         }
     }
+
+    private fun jpegExifRotationDegrees(bytes: ByteArray): Int = runCatching {
+        when (ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL
+        )) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270
+            else -> 0
+        }
+    }.getOrDefault(0)
 
     private fun orientAndCrop(
         source: Bitmap,
@@ -1403,21 +1476,9 @@ class CameraEngine(private val context: Context) {
     private fun calculateJpegOrientation(): Int {
         val sensorOrientation = activeCharacteristics
             ?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-        val displayRotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            context.display?.rotation ?: Surface.ROTATION_0
-        } else {
-            @Suppress("DEPRECATION")
-            (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.rotation
-        }
-        val displayDegrees = when (displayRotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
         val facing = activeCharacteristics?.get(CameraCharacteristics.LENS_FACING)
         val direction = if (facing == CameraCharacteristics.LENS_FACING_FRONT) -1 else 1
-        return (sensorOrientation + displayDegrees * direction + 360) % 360
+        return (sensorOrientation + deviceOrientationDegrees * direction + 360) % 360
     }
 
     private fun applyZoomToRequest(builder: CaptureRequest.Builder, zoomRatio: Float) {
@@ -1439,6 +1500,12 @@ class CameraEngine(private val context: Context) {
     }
 
     private fun getOutputDirectory(): File {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+                "Camera"
+            ).apply { mkdirs() }
+        }
         val mediaDir = context.externalMediaDirs.firstOrNull()?.let {
             File(it, "hooru").apply { mkdirs() }
         }

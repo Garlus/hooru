@@ -8,31 +8,36 @@ import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import com.purepixel.camera.camera.CameraEngine
 import com.purepixel.camera.ui.PurePixelScreen
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var cameraEngine: CameraEngine
+    private var cameraEngine: CameraEngine? = null
+    private val cameraReady = mutableStateOf(false)
 
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions[Manifest.permission.CAMERA] == true) {
-            initUi()
+            prepareCamera()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        requestHighestRefreshRate()
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
         // Keep the camera window in the default SDR composition mode. Forcing an
@@ -47,19 +52,25 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = false
             show(WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars())
         }
-        cameraEngine = CameraEngine(this)
-        // The GL renderer can publish its SurfaceTexture during setContent(), before
-        // onResume(). Camera2 therefore needs its handler before the UI is composed.
-        cameraEngine.startBackgroundThread()
+        initUi()
 
-        if (hasRequiredPermissions()) {
-            initUi()
-        } else {
-            requestPermissionsLauncher.launch(
-                arrayOf(Manifest.permission.CAMERA)
-            )
+        // Let Android replace its starting window with our black Compose surface
+        // before doing camera discovery or presenting the permission dialog.
+        window.decorView.post {
+            if (hasRequiredPermissions()) {
+                prepareCamera()
+            } else {
+                requestPermissionsLauncher.launch(requiredPermissions())
+            }
         }
     }
+
+    private fun requiredPermissions(): Array<String> = buildList {
+        add(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+    }.toTypedArray()
 
     private fun initUi() {
         setContent {
@@ -72,15 +83,39 @@ class MainActivity : ComponentActivity() {
                     background = Color.Black
                 )
             ) {
-                PurePixelScreen(cameraEngine = cameraEngine)
+                if (cameraReady.value) {
+                    PurePixelScreen(
+                        cameraEngine = requireNotNull(cameraEngine),
+                        onFirstPreviewFrame = ::requestHighestRefreshRate
+                    )
+                } else {
+                    Box(Modifier.fillMaxSize().background(Color.Black))
+                }
             }
         }
     }
 
+    private fun prepareCamera() {
+        if (cameraEngine != null) {
+            cameraReady.value = true
+            return
+        }
+        // Construction is small but still kept behind the first black frame. The
+        // handler must exist before Compose creates the GL camera surface.
+        cameraEngine = CameraEngine(this).also { engine ->
+            engine.startBackgroundThread()
+            engine.startOrientationTracking()
+        }
+        cameraReady.value = true
+    }
+
     private fun hasRequiredPermissions(): Boolean {
-        return ContextCompat.checkSelfPermission(
+        val cameraGranted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
+        val storageGranted = Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        return cameraGranted && storageGranted
     }
 
     /** Keep Compose interactions, including the settings screen, on the panel's fastest mode. */
@@ -100,16 +135,20 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onResume() {
-        // The GL lifecycle observer may publish a recreated SurfaceTexture from
-        // inside super.onResume(), so Camera2's callback thread must exist first.
-        cameraEngine.startBackgroundThread()
         super.onResume()
-        cameraEngine.resumeCamera()
+        cameraEngine?.let { engine ->
+            engine.startBackgroundThread()
+            engine.startOrientationTracking()
+            engine.resumeCamera()
+        }
     }
 
     override fun onPause() {
-        cameraEngine.closeCamera()
-        cameraEngine.stopBackgroundThread()
+        cameraEngine?.let { engine ->
+            engine.stopOrientationTracking()
+            engine.closeCamera()
+            engine.stopBackgroundThread()
+        }
         super.onPause()
     }
 
@@ -117,8 +156,10 @@ class MainActivity : ComponentActivity() {
         if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) &&
             event.repeatCount == 0
         ) {
-            cameraEngine.requestHardwareShutter()
-            return true
+            cameraEngine?.let {
+                it.requestHardwareShutter()
+                return true
+            }
         }
         return super.onKeyDown(keyCode, event)
     }

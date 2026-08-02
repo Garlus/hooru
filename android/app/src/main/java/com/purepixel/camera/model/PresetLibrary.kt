@@ -6,9 +6,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.os.Build
 import com.purepixel.camera.R
 import com.purepixel.camera.gl.createPresetColorMatrix
 import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
@@ -19,7 +21,9 @@ import kotlinx.coroutines.withContext
 /** Persistent, device-local preset library. XMP source remains the canonical format. */
 class PresetLibrary(private val context: Context) {
     private val prefs = context.getSharedPreferences("preset_library", Context.MODE_PRIVATE)
-    private val customDirectory = File(context.filesDir, "lightroom_presets").apply { mkdirs() }
+    // Merely constructing the camera UI must not touch storage. The directory is
+    // created lazily only when the user actually imports a preset.
+    private val customDirectory = File(context.filesDir, "lightroom_presets")
 
     private val packagedSodiumPresets: List<Preset> by lazy {
         context.assets.list(PACKAGED_SODIUM_DIRECTORY).orEmpty().sorted().mapNotNull { fileName ->
@@ -67,6 +71,9 @@ class PresetLibrary(private val context: Context) {
     val signatureLooks: List<Preset>
         get() = builtInPresets().filter { it.category == PresetCategory.ESSENTIALS && it.id != "no_filter" }
 
+    /** Lightweight set used for the first frame; packaged XMP files load later. */
+    fun startupPresets(): List<Preset> = Preset.DEFAULT_PRESETS.map(::applySavedEdits)
+
     fun builtInPresets(): List<Preset> =
         (Preset.DEFAULT_PRESETS + packagedSodiumPresets + packagedCommunityPresets).map(::applySavedEdits)
 
@@ -105,6 +112,7 @@ class PresetLibrary(private val context: Context) {
             uniqueName(fallbackName, id)
         } else firstChoice
         val preset = parsed.copy(name = uniqueName)
+        customDirectory.mkdirs()
         File(customDirectory, "$id.xmp").writeText(text)
         saveEdits(
             Preset(
@@ -126,7 +134,15 @@ class PresetLibrary(private val context: Context) {
     }
 
     fun selectedIds(defaultIds: Set<String>): Set<String> {
-        var selected = prefs.getStringSet(KEY_SELECTED, null)?.toSet() ?: defaultIds
+        val stored = prefs.getStringSet(KEY_SELECTED, null)?.toSet()
+        val migrationsComplete = prefs.getBoolean(KEY_FILM_LIBRARY_MIGRATED, false) &&
+            prefs.getBoolean(KEY_FIRST_DRAFT_REMOVED, false) &&
+            prefs.getBoolean(KEY_CHROMATIC_REPLACED, false) &&
+            prefs.getBoolean(KEY_NEW_LOOKS_MIGRATED, false) &&
+            prefs.getBoolean(KEY_TEN_DEFAULTS_MIGRATED, false)
+        if (stored != null && migrationsComplete) return stored
+
+        var selected = stored ?: defaultIds
         if (!prefs.getBoolean(KEY_FILM_LIBRARY_MIGRATED, false)) {
             selected = (selected - LEGACY_LOOK_IDS) + defaultIds
         }
@@ -272,18 +288,57 @@ class FilterPreviewCache(private val context: Context) {
     private val cache = ConcurrentHashMap<String, FilterPreview>()
     private val renderMutex = Mutex()
     private val source: Bitmap by lazy { BitmapFactory.decodeResource(context.resources, R.drawable.filter_sample) }
+    private val diskCacheDirectory = File(context.cacheDir, "preset_preview_v1").apply { mkdirs() }
 
     private fun cacheKey(preset: Preset) = "${preset.id}:${preset.intensity}:${preset.grain}:${preset.halation}"
 
     fun invalidate(presetId: String) {
         cache.keys.removeAll { it.startsWith("$presetId:") }
+        diskCacheDirectory.listFiles().orEmpty()
+            .filter { it.name.startsWith("${presetId.hashCode()}_") }
+            .forEach(File::delete)
     }
 
     suspend fun preview(preset: Preset): FilterPreview = cache[cacheKey(preset)] ?: renderMutex.withLock {
-        cache[cacheKey(preset)] ?: withContext(Dispatchers.Default) {
+        cache[cacheKey(preset)] ?: loadFromDisk(preset) ?: withContext(Dispatchers.Default) {
             val bitmap = render(preset)
-            FilterPreview(bitmap, averageColor(bitmap)).also { cache[cacheKey(preset)] = it }
+            FilterPreview(bitmap, averageColor(bitmap))
+        }.also { preview ->
+            cache[cacheKey(preset)] = preview
+            saveToDisk(preset, preview)
         }
+    }
+
+    private fun diskFile(preset: Preset): File {
+        val fingerprint = MessageDigest.getInstance("SHA-256")
+            .digest(cacheKey(preset).toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return File(diskCacheDirectory, "${preset.id.hashCode()}_$fingerprint.webp")
+    }
+
+    private suspend fun loadFromDisk(preset: Preset): FilterPreview? = withContext(Dispatchers.IO) {
+        val bitmap = BitmapFactory.decodeFile(diskFile(preset).absolutePath) ?: return@withContext null
+        FilterPreview(bitmap, averageColor(bitmap))
+    }
+
+    private suspend fun saveToDisk(preset: Preset, preview: FilterPreview) = withContext(Dispatchers.IO) {
+        val destination = diskFile(preset)
+        val temporary = File(diskCacheDirectory, "${destination.name}.tmp")
+        runCatching {
+            FileOutputStream(temporary).use { stream ->
+                val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Bitmap.CompressFormat.WEBP_LOSSY
+                } else {
+                    @Suppress("DEPRECATION")
+                    Bitmap.CompressFormat.WEBP
+                }
+                check(preview.bitmap.compress(format, 90, stream))
+            }
+            if (!temporary.renameTo(destination)) {
+                temporary.copyTo(destination, overwrite = true)
+                temporary.delete()
+            }
+        }.onFailure { temporary.delete() }
     }
 
     private fun averageColor(bitmap: Bitmap): Int {

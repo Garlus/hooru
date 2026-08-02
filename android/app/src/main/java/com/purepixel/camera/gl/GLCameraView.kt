@@ -42,7 +42,8 @@ data class PreviewAnalysis(
 
 class GLCameraView(
     context: Context,
-    onSurfaceReady: (SurfaceTexture) -> Unit
+    onSurfaceReady: (SurfaceTexture) -> Unit,
+    onFirstPreviewFrame: () -> Unit = { }
 ) : GLSurfaceView(context) {
 
     @Volatile private var renderingActive = false
@@ -50,7 +51,8 @@ class GLCameraView(
     val renderer: LutShaderRenderer = LutShaderRenderer(
         onSurfaceReady = onSurfaceReady,
         requestRender = { if (renderingActive) requestRender() },
-        onAnalysis = { analysis -> mainHandler.post { analysisListener(analysis) } }
+        onAnalysis = { analysis -> mainHandler.post { analysisListener(analysis) } },
+        onFirstCameraFrame = { mainHandler.post(onFirstPreviewFrame) }
     )
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lutExecutor = Executors.newSingleThreadExecutor { task ->
@@ -177,6 +179,7 @@ fun CameraPreviewGL(
     onSurfaceReady: (SurfaceTexture) -> Unit,
     onGLViewReady: (GLCameraView) -> Unit = { },
     onPreviewReady: (GLCameraView) -> Unit = { },
+    onFirstPreviewFrame: () -> Unit = { },
     onPreviewFrame: (Bitmap) -> Unit = { },
     onPreviewAnalysis: (PreviewAnalysis) -> Unit = { }
 ) {
@@ -184,7 +187,7 @@ fun CameraPreviewGL(
     var cameraView by remember { mutableStateOf<GLCameraView?>(null) }
     AndroidView(
         factory = { ctx ->
-            GLCameraView(ctx, onSurfaceReady).apply {
+            GLCameraView(ctx, onSurfaceReady, onFirstPreviewFrame).apply {
                 layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT

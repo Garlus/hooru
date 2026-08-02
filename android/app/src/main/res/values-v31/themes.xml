@@ -1,12 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.Hooru" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowFullscreen">false</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
-        <item name="android:windowBackground">#000000</item>
+        <item name="android:windowBackground">@color/black</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+
+        <!-- Android 12+ mandates a starting window. Keep it completely black and
+             replace the default launcher icon with a transparent 1dp drawable. -->
+        <item name="android:windowSplashScreenBackground">@color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/startup_transparent</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/black</item>
+        <item name="android:windowSplashScreenAnimationDuration">0</item>
     </style>
 </resources>
