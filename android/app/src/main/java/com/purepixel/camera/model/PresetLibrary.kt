@@ -6,13 +6,12 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
-import android.os.Build
+import android.util.LruCache
 import com.purepixel.camera.R
 import com.purepixel.camera.gl.createPresetColorMatrix
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -29,29 +28,28 @@ class PresetLibrary(private val context: Context) {
         context.assets.list(PACKAGED_SODIUM_DIRECTORY).orEmpty().sorted().mapNotNull { fileName ->
             runCatching {
                 val number = fileName.removePrefix("GX-02_").removeSuffix(".xmp")
+                val id = "sodium_$number"
+                val category = CURATED_FILTER_CATEGORIES[id] ?: return@mapNotNull null
                 val displayName = if (fileName == "vapor_grain.xmp") "Nightwire Grain" else "Nightwire $number"
                 val xmp = context.assets.open("$PACKAGED_SODIUM_DIRECTORY/$fileName")
                     .bufferedReader().use { it.readText() }
                 Preset(
-                    id = "sodium_$number",
+                    id = id,
                     name = displayName,
                     accentColor = SODIUM_ACCENTS[number.toIntOrNull()?.rem(SODIUM_ACCENTS.size) ?: 0],
                     lightroom = LightroomPreset.fromXmp(xmp, displayName),
-                    category = PresetCategory.CHROMATIC
+                    category = category
                 )
             }.getOrNull()
         }
     }
 
     private val packagedCommunityPresets: List<Preset> by lazy {
-        listOf(
-            PACKAGED_URBAN_DIRECTORY to PresetCategory.URBAN,
-            PACKAGED_AFTERGLOW_DIRECTORY to PresetCategory.AFTERGLOW,
-            PACKAGED_WANDERLIGHT_DIRECTORY to PresetCategory.WANDERLIGHT
-        ).flatMap { (directory, category) ->
+        listOf(PACKAGED_URBAN_DIRECTORY, PACKAGED_AFTERGLOW_DIRECTORY, PACKAGED_WANDERLIGHT_DIRECTORY).flatMap { directory ->
             context.assets.list(directory).orEmpty().sorted().mapNotNull { fileName ->
                 runCatching {
-                    val id = "${category.name.lowercase()}_${fileName.removeSuffix(".xmp")}"
+                    val id = "${directory.substringAfterLast('/')}_${fileName.removeSuffix(".xmp")}"
+                    val category = CURATED_FILTER_CATEGORIES[id] ?: return@mapNotNull null
                     val name = fileName.removeSuffix(".xmp").split('_').joinToString(" ") { word ->
                         word.replaceFirstChar { it.uppercase() }
                     }
@@ -68,14 +66,24 @@ class PresetLibrary(private val context: Context) {
         }
     }
 
-    val signatureLooks: List<Preset>
-        get() = builtInPresets().filter { it.category == PresetCategory.ESSENTIALS && it.id != "no_filter" }
-
     /** Lightweight set used for the first frame; packaged XMP files load later. */
-    fun startupPresets(): List<Preset> = Preset.DEFAULT_PRESETS.map(::applySavedEdits)
+    fun startupPresets(): List<Preset> = withDisplayNames(Preset.DEFAULT_PRESETS.map(::applySavedEdits))
 
     fun builtInPresets(): List<Preset> =
-        (Preset.DEFAULT_PRESETS + packagedSodiumPresets + packagedCommunityPresets).map(::applySavedEdits)
+        withDisplayNames((Preset.DEFAULT_PRESETS + packagedSodiumPresets + packagedCommunityPresets).map(::applySavedEdits))
+
+    private fun withDisplayNames(presets: List<Preset>): List<Preset> {
+        val categoryCounters = mutableMapOf<PresetCategory, Int>()
+        return presets.map { preset ->
+            if (preset.isAddButton || preset.id in Preset.FIXED_QUICK_PRESET_IDS) {
+                preset
+            } else {
+                val number = (categoryCounters[preset.category] ?: 0) + 1
+                categoryCounters[preset.category] = number
+                preset.copy(name = "%s%02d".format(preset.category.code, number))
+            }
+        }
+    }
 
     fun customPresets(): List<Preset> = customDirectory.listFiles()
         .orEmpty()
@@ -88,7 +96,7 @@ class PresetLibrary(private val context: Context) {
                 applySavedEdits(Preset(
                     id = file.nameWithoutExtension,
                     name = lightroom.name,
-                    accentColor = android.graphics.Color.parseColor("#FF453A"),
+                    accentColor = android.graphics.Color.parseColor("#1C85F3"),
                     assetPath = file.absolutePath,
                     lightroom = lightroom,
                     isCustom = true
@@ -126,7 +134,7 @@ class PresetLibrary(private val context: Context) {
         return Preset(
             id = id,
             name = preset.name,
-            accentColor = android.graphics.Color.parseColor("#FF453A"),
+            accentColor = android.graphics.Color.parseColor("#1C85F3"),
             assetPath = File(customDirectory, "$id.xmp").absolutePath,
             lightroom = preset,
             isCustom = true
@@ -135,43 +143,22 @@ class PresetLibrary(private val context: Context) {
 
     fun selectedIds(defaultIds: Set<String>): Set<String> {
         val stored = prefs.getStringSet(KEY_SELECTED, null)?.toSet()
-        val migrationsComplete = prefs.getBoolean(KEY_FILM_LIBRARY_MIGRATED, false) &&
-            prefs.getBoolean(KEY_FIRST_DRAFT_REMOVED, false) &&
-            prefs.getBoolean(KEY_CHROMATIC_REPLACED, false) &&
-            prefs.getBoolean(KEY_NEW_LOOKS_MIGRATED, false) &&
-            prefs.getBoolean(KEY_TEN_DEFAULTS_MIGRATED, false)
+        val migrationsComplete = prefs.getBoolean(KEY_FILTER_LIBRARY_REORGANIZED, false)
         if (stored != null && migrationsComplete) return stored
 
         var selected = stored ?: defaultIds
-        if (!prefs.getBoolean(KEY_FILM_LIBRARY_MIGRATED, false)) {
-            selected = (selected - LEGACY_LOOK_IDS) + defaultIds
-        }
-        if (!prefs.getBoolean(KEY_FIRST_DRAFT_REMOVED, false)) {
-            selected -= FIRST_DRAFT_LOOK_IDS
-        }
-        if (!prefs.getBoolean(KEY_CHROMATIC_REPLACED, false)) {
-            selected -= CHROMATIC_DRAFT_LOOK_IDS
-        }
-        if (!prefs.getBoolean(KEY_NEW_LOOKS_MIGRATED, false)) {
-            selected += setOf("hooru_look", "android_processing")
-        }
-
-        // Existing installations used to opt every built-in look into the shutter.
-        // Trim only that legacy all-selected state; deliberate custom selections stay intact.
-        if (!prefs.getBoolean(KEY_TEN_DEFAULTS_MIGRATED, false)) {
-            val builtInIds = Preset.DEFAULT_PRESETS.filterNot(Preset::isAddButton).map(Preset::id)
-            if (selected.containsAll(builtInIds)) {
-                selected -= builtInIds.drop(10).toSet()
-            }
-        }
+        // Remove retired built-ins and fixed processing entries while retaining any
+        // deliberately imported filters in the user's selection.
+        selected = selected - RETIRED_BUILT_IN_IDS - Preset.FIXED_QUICK_PRESET_IDS
+        // Older versions could persist every packaged filter as active. Replace
+        // that legacy overflow with the ordered starter selection rather than
+        // silently keeping an arbitrary ten from an unordered preference set.
+        if (selected.size > 10) selected = defaultIds
+        if (selected == PREVIOUS_DEFAULT_SELECTED_PRESET_IDS) selected = defaultIds
 
         prefs.edit()
             .putStringSet(KEY_SELECTED, selected)
-            .putBoolean(KEY_NEW_LOOKS_MIGRATED, true)
-            .putBoolean(KEY_TEN_DEFAULTS_MIGRATED, true)
-            .putBoolean(KEY_FILM_LIBRARY_MIGRATED, true)
-            .putBoolean(KEY_FIRST_DRAFT_REMOVED, true)
-            .putBoolean(KEY_CHROMATIC_REPLACED, true)
+            .putBoolean(KEY_FILTER_LIBRARY_REORGANIZED, true)
             .apply()
         return selected
     }
@@ -222,7 +209,11 @@ class PresetLibrary(private val context: Context) {
         name = prefs.getString("$KEY_NAME${preset.id}", preset.name).orEmpty().ifBlank { preset.name },
         intensity = prefs.getFloat("$KEY_INTENSITY${preset.id}", preset.intensity).coerceIn(0f, 1f),
         grain = prefs.getFloat("$KEY_GRAIN${preset.id}", preset.grain).coerceIn(0f, 1f),
-        halation = prefs.getFloat("$KEY_HALATION${preset.id}", preset.halation).coerceIn(0f, 1f)
+        halation = prefs.getFloat("$KEY_HALATION${preset.id}", preset.halation).coerceIn(0f, 1f),
+        hasUserEdits = prefs.contains("$KEY_NAME${preset.id}") ||
+            prefs.contains("$KEY_INTENSITY${preset.id}") ||
+            prefs.contains("$KEY_GRAIN${preset.id}") ||
+            prefs.contains("$KEY_HALATION${preset.id}")
     )
 
     fun uniqueName(requested: String, excludingId: String? = null): String {
@@ -240,21 +231,35 @@ class PresetLibrary(private val context: Context) {
     companion object {
         private const val KEY_SELECTED = "selected_ids"
         private const val KEY_RECENT = "recent_ids"
-        private const val KEY_NEW_LOOKS_MIGRATED = "new_looks_migrated_v1"
-        private const val KEY_TEN_DEFAULTS_MIGRATED = "ten_default_looks_migrated_v1"
-        private const val KEY_FILM_LIBRARY_MIGRATED = "film_library_migrated_v1"
-        private const val KEY_FIRST_DRAFT_REMOVED = "first_draft_removed_v1"
-        private const val KEY_CHROMATIC_REPLACED = "chromatic_replaced_v1"
-        private val LEGACY_LOOK_IDS = setOf("leica_mono", "teal_orange", "portra_400", "classic_chrome", "warm_fade", "cool_night", "high_contrast", "cinema_green", "soft_rose")
-        private val FIRST_DRAFT_LOOK_IDS = setOf(
-            "carbon_mono", "sunlit", "blue_hour", "amber_35", "pastel_negative",
-            "dusty_slide", "golden_expiry", "motel_flash", "cine_olive", "cine_log",
-            "copper_frame", "sodium_dream", "neon_rain", "velvet_night", "liminal",
-            "electric_bloom", "acid_wash"
+        private const val KEY_FILTER_LIBRARY_REORGANIZED = "filter_library_reorganized_v3"
+        private val PREVIOUS_DEFAULT_SELECTED_PRESET_IDS = setOf(
+            "sodium_001", "sodium_005", "sodium_006", "sodium_009", "sodium_010",
+            "sodium_016", "urban_detroit", "afterglow_fin_de_jornada",
+            "wanderlight_way_to_heaven", "silver_push"
         )
-        private val CHROMATIC_DRAFT_LOOK_IDS = setOf(
-            "amber_grid", "violet_void", "chlorine_dream", "arcade_bleed", "cobalt_pull",
-            "bleach_milk", "ember_skin"
+        private val RETIRED_BUILT_IN_IDS = setOf(
+            "android_processing", "hooru_look", "clean_frame", "soft_daylight", "coastal_clear", "muted_city", "summer_glass",
+            "infra_flora", "thermal_bloom", "sodium_004", "urban_adams_tunnel", "urban_arco",
+            "urban_capitalinas", "urban_times_square", "afterglow_no_context", "afterglow_the_duo",
+            "afterglow_weekend", "wanderlight_cromer_norfolk", "wanderlight_open_road", "wanderlight_paris"
+        )
+        private val CURATED_FILTER_CATEGORIES = mapOf(
+            "sodium_001" to PresetCategory.WARM, "sodium_005" to PresetCategory.WARM,
+            "sodium_006" to PresetCategory.WARM, "sodium_009" to PresetCategory.WARM,
+            "sodium_010" to PresetCategory.WARM, "sodium_016" to PresetCategory.WARM,
+            "urban_detroit" to PresetCategory.WARM, "afterglow_fin_de_jornada" to PresetCategory.WARM,
+            "wanderlight_way_to_heaven" to PresetCategory.WARM,
+
+            "sodium_002" to PresetCategory.COLD, "sodium_007" to PresetCategory.COLD,
+            "sodium_008" to PresetCategory.COLD, "sodium_011" to PresetCategory.COLD,
+            "sodium_017" to PresetCategory.COLD, "sodium_020" to PresetCategory.COLD,
+            "urban_london_buslights" to PresetCategory.COLD, "afterglow_rainbow" to PresetCategory.COLD,
+            "wanderlight_veli_rat" to PresetCategory.COLD,
+
+            "sodium_003" to PresetCategory.CONTRAST, "sodium_012" to PresetCategory.CONTRAST,
+            "sodium_018" to PresetCategory.CONTRAST, "sodium_019" to PresetCategory.CONTRAST,
+            "sodium_021" to PresetCategory.CONTRAST, "sodium_022" to PresetCategory.CONTRAST,
+            "sodium_vapor_grain" to PresetCategory.CONTRAST, "urban_paris_in_tokyo" to PresetCategory.CONTRAST
         )
         private const val KEY_NAME = "name_"
         private const val KEY_INTENSITY = "intensity_"
@@ -285,28 +290,57 @@ class PresetLibrary(private val context: Context) {
 data class FilterPreview(val bitmap: Bitmap, val accentColor: Int)
 
 class FilterPreviewCache(private val context: Context) {
-    private val cache = ConcurrentHashMap<String, FilterPreview>()
+    private val cache = object : LruCache<String, FilterPreview>(8 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: FilterPreview): Int = value.bitmap.allocationByteCount
+    }
     private val renderMutex = Mutex()
-    private val source: Bitmap by lazy { BitmapFactory.decodeResource(context.resources, R.drawable.filter_sample) }
-    private val diskCacheDirectory = File(context.cacheDir, "preset_preview_v1").apply { mkdirs() }
+    private var source: Bitmap? = null
+
+    suspend fun clearMemory() = renderMutex.withLock {
+        // Compose may still draw these images while processing the stop event.
+        // Drop references without recycling shared bitmaps.
+        cache.evictAll()
+        source = null
+    }
+    private val diskCacheDirectory = File(context.cacheDir, "preset_preview_v1")
 
     private fun cacheKey(preset: Preset) = "${preset.id}:${preset.intensity}:${preset.grain}:${preset.halation}"
 
     fun invalidate(presetId: String) {
-        cache.keys.removeAll { it.startsWith("$presetId:") }
+        cache.snapshot().keys
+            .filter { it.startsWith("$presetId:") }
+            .forEach(cache::remove)
         diskCacheDirectory.listFiles().orEmpty()
             .filter { it.name.startsWith("${presetId.hashCode()}_") }
             .forEach(File::delete)
     }
 
-    suspend fun preview(preset: Preset): FilterPreview = cache[cacheKey(preset)] ?: renderMutex.withLock {
-        cache[cacheKey(preset)] ?: loadFromDisk(preset) ?: withContext(Dispatchers.Default) {
-            val bitmap = render(preset)
-            FilterPreview(bitmap, averageColor(bitmap))
-        }.also { preview ->
-            cache[cacheKey(preset)] = preview
-            saveToDisk(preset, preview)
+    suspend fun preview(preset: Preset): FilterPreview {
+        val key = cacheKey(preset)
+        cache.get(key)?.let { return it }
+        return renderMutex.withLock {
+            cache.get(key)?.let { return@withLock it }
+            // Cache every source in memory; only newly rendered images need a disk write.
+            val stored = loadPrebaked(preset) ?: loadFromDisk(preset)
+            val preview = stored ?: withContext(Dispatchers.Default) {
+                val bitmap = render(preset)
+                FilterPreview(bitmap, averageColor(bitmap))
+            }
+            cache.put(key, preview)
+            if (stored == null) saveToDisk(preset, preview)
+            preview
         }
+    }
+
+    private suspend fun loadPrebaked(preset: Preset): FilterPreview? = withContext(Dispatchers.IO) {
+        if (preset.isCustom || preset.hasUserEdits || preset.isAddButton) return@withContext null
+        runCatching {
+            context.assets.open("preset_previews/${preset.id}.webp").use { stream ->
+                BitmapFactory.decodeStream(stream)?.let { bitmap ->
+                    FilterPreview(bitmap, averageColor(bitmap))
+                }
+            }
+        }.getOrNull()
     }
 
     private fun diskFile(preset: Preset): File {
@@ -325,20 +359,27 @@ class FilterPreviewCache(private val context: Context) {
         val destination = diskFile(preset)
         val temporary = File(diskCacheDirectory, "${destination.name}.tmp")
         runCatching {
+            diskCacheDirectory.mkdirs()
             FileOutputStream(temporary).use { stream ->
-                val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    Bitmap.CompressFormat.WEBP_LOSSY
-                } else {
-                    @Suppress("DEPRECATION")
-                    Bitmap.CompressFormat.WEBP
-                }
-                check(preview.bitmap.compress(format, 90, stream))
+                check(preview.bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, 90, stream))
             }
             if (!temporary.renameTo(destination)) {
                 temporary.copyTo(destination, overwrite = true)
                 temporary.delete()
             }
+            trimDiskCache()
         }.onFailure { temporary.delete() }
+    }
+
+    private fun trimDiskCache(maxBytes: Long = 48L * 1024 * 1024) {
+        val files = diskCacheDirectory.listFiles().orEmpty()
+            .filter(File::isFile)
+            .sortedByDescending(File::lastModified)
+        var retained = 0L
+        files.forEach { file ->
+            retained += file.length()
+            if (retained > maxBytes) file.delete()
+        }
     }
 
     private fun averageColor(bitmap: Bitmap): Int {
@@ -359,6 +400,9 @@ class FilterPreviewCache(private val context: Context) {
     }
 
     private fun render(preset: Preset): Bitmap {
+        val source = source ?: requireNotNull(
+            BitmapFactory.decodeResource(context.resources, R.drawable.filter_sample)
+        ).also { source = it }
         val filtered = preset.lightroom?.applyToBitmap(source, lutSize = 32) ?: run {
             val matrix = createPresetColorMatrix(preset.id) ?: return@run source
             Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888).also { output ->

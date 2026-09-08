@@ -4,17 +4,13 @@ import android.graphics.Color
 
 enum class ProcessingMode {
     NATURAL,
-    HOORU,
-    ANDROID
+    HOORU
 }
 
-enum class PresetCategory(val label: String) {
-    ESSENTIALS("Signature & Clean"),
-    MONO("Einfarbig."),
-    CHROMATIC("Chromatic Chaos"),
-    URBAN("Urban Stories"),
-    AFTERGLOW("Afterglow"),
-    WANDERLIGHT("Wanderlight")
+enum class PresetCategory(val label: String, val code: String) {
+    WARM("Warm", "WA"),
+    COLD("Cold", "CO"),
+    CONTRAST("Contrast", "CTR")
 }
 
 data class Preset(
@@ -28,35 +24,33 @@ data class Preset(
     val intensity: Float = 1f,
     val grain: Float = 0f,
     val halation: Float = 0f,
-    val category: PresetCategory = PresetCategory.ESSENTIALS,
-    val processingMode: ProcessingMode = ProcessingMode.HOORU
+    val category: PresetCategory = PresetCategory.WARM,
+    val processingMode: ProcessingMode = ProcessingMode.HOORU,
+    val hasUserEdits: Boolean = false
 ) {
     companion object {
+        val FIXED_QUICK_PRESET_IDS = setOf("no_filter")
+
+        /** The initial quick selection. The unfiltered base option is always separate. */
+        val DEFAULT_SELECTED_PRESET_IDS = linkedSetOf(
+            // CO01, CO04, CO06, CO09
+            "sodium_002", "sodium_011", "sodium_020", "wanderlight_veli_rat",
+            // WA01, WA02, WA05
+            "silver_push", "sodium_001", "sodium_009",
+            // CTR05
+            "sodium_019"
+        )
+
         val DEFAULT_PRESETS = listOf(
             Preset(
                 "no_filter",
-                "Natural",
+                "Null Processing",
                 Color.parseColor("#d7d7d7"),
+                category = PresetCategory.CONTRAST,
                 processingMode = ProcessingMode.NATURAL
             ),
-            Preset("hooru_look", "Hooru Look", Color.parseColor("#D9503F"), intensity = .82f),
-            Preset(
-                "android_processing",
-                "Android Processing",
-                Color.parseColor("#8AB4F8"),
-                processingMode = ProcessingMode.ANDROID
-            ),
-            Preset("clean_frame", "Clean Frame", Color.parseColor("#9CAFA6"), intensity = .72f, grain = .03f),
-            Preset("soft_daylight", "Soft Daylight", Color.parseColor("#C7A17C"), intensity = .70f, grain = .05f),
-            Preset("coastal_clear", "Coastal Clear", Color.parseColor("#6A9A9A"), intensity = .76f, grain = .03f),
-            Preset("muted_city", "Muted City", Color.parseColor("#8B8990"), intensity = .78f, grain = .06f),
-            Preset("summer_glass", "Summer Glass", Color.parseColor("#C2A75B"), intensity = .74f, grain = .04f),
-
-            Preset("silver_push", "Silver Push", Color.parseColor("#D6D0C5"), category = PresetCategory.MONO, intensity = 1f, grain = .58f),
-            Preset("noir_halide", "Noir Halide", Color.parseColor("#9699A0"), category = PresetCategory.MONO, intensity = 1f, grain = .76f),
-
-            Preset("infra_flora", "Infra Flora", Color.parseColor("#D64A68"), category = PresetCategory.MONO, intensity = 1f, grain = .62f, halation = .20f),
-            Preset("thermal_bloom", "Thermal Bloom", Color.parseColor("#C84C9A"), category = PresetCategory.MONO, intensity = 1f, grain = .72f, halation = .34f),
+            Preset("silver_push", "Silver Push", Color.parseColor("#D6D0C5"), category = PresetCategory.WARM, intensity = 1f, grain = .58f),
+            Preset("noir_halide", "Noir Halide", Color.parseColor("#9699A0"), category = PresetCategory.CONTRAST, intensity = 1f, grain = .76f),
 
             Preset("add_new", "+", Color.parseColor("#8e8e93"), isAddButton = true)
         )

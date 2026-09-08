@@ -13,10 +13,6 @@ captures/
 # Android Studio
 .idea/
 
-# Web converter
-web-converter/node_modules/
-web-converter/dist/
-
 # OS / editor
 .DS_Store
 *.swp

@@ -112,14 +112,26 @@ data class LightroomPreset(
         return cached.duplicate().apply { position(0) }
     }
 
-    fun applyToBitmap(source: Bitmap, lutSize: Int = DEFAULT_LUT_SIZE): Bitmap {
+    fun applyToBitmap(
+        source: Bitmap,
+        lutSize: Int = DEFAULT_LUT_SIZE,
+        intensity: Float = 1f,
+        extraGrain: Float = 0f,
+        halation: Float = 0f
+    ): Bitmap {
         val width = source.width
         val height = source.height
         val lutBuffer = buildLut(lutSize)
         val lut = ByteArray(lutBuffer.remaining())
         lutBuffer.get(lut)
         val nativeOutput = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        if (NativePresetProcessor.process(source, nativeOutput, lut, lutSize, this)) {
+        if (NativePresetProcessor.process(
+                source, nativeOutput, lut, lutSize, this,
+                intensity = intensity,
+                extraGrain = extraGrain,
+                halation = halation
+            )
+        ) {
             return nativeOutput
         }
         nativeOutput.recycle()
@@ -145,11 +157,29 @@ data class LightroomPreset(
                 val noise = grainNoise(x, y, width, height) * (.72f + .28f * midtonePresence)
                 for (j in 0..2) sampled[j] = (sampled[j] + noise).coerceIn(0f, 1f)
             }
+            val original = input[i]
+            val mix = intensity.coerceIn(0f, 1f)
+            var red = Color.red(original) / 255f + (sampled[0] - Color.red(original) / 255f) * mix
+            var green = Color.green(original) / 255f + (sampled[1] - Color.green(original) / 255f) * mix
+            var blue = Color.blue(original) / 255f + (sampled[2] - Color.blue(original) / 255f) * mix
+            if (halation > 0f) {
+                val luma = .2126f * red + .7152f * green + .0722f * blue
+                val glow = ((luma - .72f) / .28f).coerceIn(0f, 1f) * halation.coerceIn(0f, 1f) * .24f
+                red += glow
+                green += glow * (72f / 255f)
+                blue -= glow * (32f / 255f)
+            }
+            if (extraGrain > 0f) {
+                var hash = i * 374761393 + 668265263
+                hash = (hash xor (hash ushr 13)) * 1274126177
+                val noise = ((hash and 0xffff) / 32767.5f - 1f) * extraGrain.coerceIn(0f, 1f) * (22f / 255f)
+                red += noise; green += noise; blue += noise
+            }
             spatial[i] = Color.argb(
                 Color.alpha(p),
-                (sampled[0]*255).roundToInt(),
-                (sampled[1]*255).roundToInt(),
-                (sampled[2]*255).roundToInt()
+                (red.coerceIn(0f, 1f)*255).roundToInt(),
+                (green.coerceIn(0f, 1f)*255).roundToInt(),
+                (blue.coerceIn(0f, 1f)*255).roundToInt()
             )
         }
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)

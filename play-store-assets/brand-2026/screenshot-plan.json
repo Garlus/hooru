@@ -1,0 +1,44 @@
+[
+  {
+    "file": "01-live.png",
+    "headline": "Dein Look. Schon live.",
+    "caption": "Sieh deinen Filter direkt im Sucher.",
+    "capture": "Kamera mit aktivem Filter und geöffnetem Filterkarussell",
+    "alt": "Kamera mit aktivem Filter und geöffnetem Filterkarussell"
+  },
+  {
+    "file": "02-library.png",
+    "headline": "Ein Motiv. Viele Stimmungen.",
+    "caption": "Finde deinen Stil in der Filterbibliothek.",
+    "capture": "Filterbibliothek mit verschiedenen Kollektionen",
+    "alt": "Filterbibliothek mit verschiedenen Kollektionen"
+  },
+  {
+    "file": "03-edit.png",
+    "headline": "Mach den Look zu deinem.",
+    "caption": "Intensität, Grain und Halation anpassen.",
+    "capture": "Look bearbeiten mit drei Reglern",
+    "alt": "Look bearbeiten mit drei Reglern"
+  },
+  {
+    "file": "04-exposure.png",
+    "headline": "Licht bewusst gestalten.",
+    "caption": "ISO und Belichtung direkt im Blick.",
+    "capture": "Einstellungen für Belichtung und Fokus",
+    "alt": "Einstellungen für Belichtung und Fokus"
+  },
+  {
+    "file": "05-composition.png",
+    "headline": "Dein Blick. Dein Bildaufbau.",
+    "caption": "Raster und Wasserwaage für deine Komposition.",
+    "capture": "Einstellungen für Seitenverhältnis, Fotogitter und Wasserwaage",
+    "alt": "Einstellungen für Seitenverhältnis, Fotogitter und Wasserwaage"
+  },
+  {
+    "file": "06-import.png",
+    "headline": "Deine Presets. In deiner Kamera.",
+    "caption": "Kompatible XMP-Presets importieren.",
+    "capture": "Filterbibliothek mit sichtbarem Preset-Import",
+    "alt": "Filterbibliothek mit sichtbarem Preset-Import"
+  }
+]
