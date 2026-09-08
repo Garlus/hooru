@@ -13,56 +13,56 @@
       "width": 1600,
       "height": 1900,
       "channels": 3,
-      "bytes": 147608
+      "bytes": 169134
     },
     {
       "file": "exports/feature-graphic-de.png",
       "width": 1024,
       "height": 500,
       "channels": 3,
-      "bytes": 1018617
+      "bytes": 1025290
     },
     {
       "file": "phone-screenshots/01-live.png",
       "width": 1080,
       "height": 1920,
       "channels": 3,
-      "bytes": 3174737
+      "bytes": 3174714
     },
     {
       "file": "phone-screenshots/02-library.png",
       "width": 1080,
       "height": 1920,
       "channels": 3,
-      "bytes": 2558959
+      "bytes": 2553779
     },
     {
       "file": "phone-screenshots/03-edit.png",
       "width": 1080,
       "height": 1920,
       "channels": 3,
-      "bytes": 2379991
+      "bytes": 2376651
     },
     {
       "file": "phone-screenshots/04-exposure.png",
       "width": 1080,
       "height": 1920,
       "channels": 3,
-      "bytes": 2268134
+      "bytes": 2257461
     },
     {
       "file": "phone-screenshots/05-composition.png",
       "width": 1080,
       "height": 1920,
       "channels": 3,
-      "bytes": 2273790
+      "bytes": 2263357
     },
     {
       "file": "phone-screenshots/06-import.png",
       "width": 1080,
       "height": 1920,
       "channels": 3,
-      "bytes": 2218268
+      "bytes": 2210528
     }
   ]
 }
