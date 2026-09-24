@@ -4,11 +4,16 @@ Eine kleine Android-Kamera-App mit Live-Filtern und Presets.
 
 ## Installieren
 
-Die aktuelle installierbare Android-APK liegt unter
-[`android/hooru-1.0.8-aspect-fix-debug.apk`](android/hooru-1.0.8-aspect-fix-debug.apk).
-Die APK auf ein Android-Gerät übertragen, in dessen Dateimanager öffnen und die
-Installation aus dieser Quelle erlauben. Alternativ steht dieselbe Datei bei den
-GitHub-Releases zum Download bereit.
+Die aktuelle Android-Version ist 1.0.9. Die signierte Release-APK liegt unter
+[`android/hooru-1.0.9-release.apk`](android/hooru-1.0.9-release.apk).
+Für ein Update der zuvor veröffentlichten Debug-APK gibt es
+[`android/hooru-1.0.9-debug.apk`](android/hooru-1.0.9-debug.apk), die mit demselben
+Debug-Schlüssel signiert ist. Die beiden APKs verwenden unterschiedliche Signaturen
+und können sich daher nicht gegenseitig aktualisieren.
+
+Die passende APK auf ein Android-Gerät übertragen, im Dateimanager öffnen und die
+Installation aus dieser Quelle erlauben. Beide Dateien stehen auch beim
+GitHub-Release zum Download bereit.
 
 <img src="play-store-assets/brand-2026/exports/feature-graphic-de.png" alt="Hooru: Licht. Look. Dein Moment." width="1024">
 
