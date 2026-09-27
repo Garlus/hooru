@@ -151,7 +151,7 @@ class CameraEngine(private val context: Context) {
     private var rawImageReader: ImageReader? = null
     private var jpegImageReader: ImageReader? = null
     private var jpegImageFormat: Int = ImageFormat.JPEG
-    private var ultraHdrDisabledForSession: Boolean = false
+    private val ultraHdrAvailability = UltraHdrAvailability()
     private val captureLock = Any()
     private var pendingCapture: PendingCapture? = null
     private var activeCharacteristics: CameraCharacteristics? = null
@@ -288,19 +288,21 @@ class CameraEngine(private val context: Context) {
         mainHandler.post { onFocalLengthsListener?.invoke(options) }
     }
 
+    @Synchronized
     private fun buildZoomState(): ZoomState {
         val base = baseEquivalentFocalLength
+        val ratio = currentZoomRatio
         return ZoomState(
-            ratio = currentZoomRatio,
+            ratio = ratio,
             minimumRatio = minimumZoomRatio,
             maximumRatio = maximumZoomRatio,
-            equivalentFocalLengthMillimeters = base?.times(currentZoomRatio)
+            equivalentFocalLengthMillimeters = base?.times(ratio)
         )
     }
 
     private fun dispatchZoomState() {
-        val state = buildZoomState()
-        mainHandler.post { onZoomStateListener?.invoke(state) }
+        // Read on delivery: an older queued notification must never undo a newer tap.
+        mainHandler.post { onZoomStateListener?.invoke(buildZoomState()) }
     }
 
     private fun equivalentFocalLengths(characteristics: CameraCharacteristics): List<Float> {
@@ -668,7 +670,9 @@ class CameraEngine(private val context: Context) {
             updateRawCapability(rawCaptureSupported)
             jpegImageFormat = if (
                 captureFormat != "RAW" &&
-                !ultraHdrDisabledForSession &&
+                ultraHdrAvailability.canAttempt(
+                    UltraHdrAvailability.Configuration(backCameraId, captureFormat, jpegResolutionMode.name)
+                ) &&
                 !map?.getOutputSizes(ImageFormat.JPEG_R).isNullOrEmpty()
             ) {
                 ImageFormat.JPEG_R
@@ -768,7 +772,6 @@ class CameraEngine(private val context: Context) {
         baseEquivalentFocalLength = null
         currentZoomRatio = 1f
         currentHardwareZoomRatio = 1f
-        ultraHdrDisabledForSession = false
         // The front and back cameras can expose different Camera2 capabilities.
         // Hide RAW immediately while the newly selected camera is reopening.
         updateRawCapability(false)
@@ -807,7 +810,7 @@ class CameraEngine(private val context: Context) {
                 CaptureRequest.CONTROL_AE_MODE,
                 if (flashMode == FlashMode.AUTO) CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH else CaptureRequest.CONTROL_AE_MODE_ON
             )
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
             flashMode
         } catch (e: Exception) {
             isFlashEnabled = false
@@ -823,7 +826,7 @@ class CameraEngine(private val context: Context) {
         val session = captureSession ?: return whiteBalanceMode
         return try {
             applyWhiteBalanceSettings(builder)
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
             whiteBalanceMode
         } catch (e: Exception) {
             Log.e(TAG, "Unable to set white balance", e)
@@ -901,7 +904,7 @@ class CameraEngine(private val context: Context) {
         val session = captureSession ?: return
         try {
             applyImageProcessingPreference(builder)
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
         } catch (e: Exception) {
             Log.w(TAG, "Unable to update processing mode", e)
         }
@@ -1165,7 +1168,7 @@ class CameraEngine(private val context: Context) {
         val session = captureSession ?: return
         try {
             applyExposureSettings(builder)
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Unable to apply exposure controls", e)
         }
@@ -1318,12 +1321,20 @@ class CameraEngine(private val context: Context) {
                 applyZoomToRequest(this, currentHardwareZoomRatio)
             }
 
+            // Capture the attempted output configuration: callbacks can arrive after a lens switch.
+            val attemptedJpegFormat = jpegImageFormat
+            val attemptedConfiguration = UltraHdrAvailability.Configuration(
+                device.id, captureFormat, jpegResolutionMode.name
+            )
             val stateCallback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     val accepted = synchronized(this@CameraEngine) {
                         if (generation != cameraGeneration || cameraDevice !== device) {
                             false
                         } else {
+                            // A tap may have arrived while Camera2 configured the
+                            // outputs, when no session existed to accept its update.
+                            applyZoomToRequest(requestBuilder, currentHardwareZoomRatio)
                             captureSession = session
                             previewRequestBuilder = requestBuilder
                             activePreviewSurface = previewSurface
@@ -1341,24 +1352,22 @@ class CameraEngine(private val context: Context) {
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     session.close()
                     previewSurface.release()
-                    if (jpegImageFormat == ImageFormat.JPEG_R) {
-                        Log.w(TAG, "Ultra HDR session unsupported; falling back to SDR JPEG")
-                        ultraHdrDisabledForSession = true
-                        val texture = previewSurfaceTexture
-                        synchronized(this@CameraEngine) { closeCameraLocked() }
-                        if (texture != null && !texture.isReleased) {
-                            handler.post { openCamera(texture, previewWidth, previewHeight) }
+                    val texture = synchronized(this@CameraEngine) {
+                        if (generation != cameraGeneration || cameraDevice !== device) return
+                        if (attemptedJpegFormat == ImageFormat.JPEG_R) {
+                            Log.w(TAG, "Ultra HDR combination unsupported; falling back to SDR JPEG")
+                            ultraHdrAvailability.reject(attemptedConfiguration)
+                        } else if (captureFormat != "JPG") {
+                            Log.w(TAG, "$captureFormat session unsupported; falling back to JPG")
+                            captureFormat = "JPG"
+                        } else {
+                            Log.e(TAG, "Camera capture session configuration failed")
+                            return
                         }
-                    } else if (captureFormat != "JPG") {
-                        Log.w(TAG, "$captureFormat session unsupported; falling back to JPG")
-                        captureFormat = "JPG"
-                        val texture = previewSurfaceTexture
-                        synchronized(this@CameraEngine) { closeCameraLocked() }
-                        if (texture != null && !texture.isReleased) {
-                            handler.post { openCamera(texture, previewWidth, previewHeight) }
-                        }
-                    } else {
-                        Log.e(TAG, "Camera capture session configuration failed")
+                        previewSurfaceTexture.also { closeCameraLocked() }
+                    }
+                    if (texture != null && !texture.isReleased) {
+                        handler.post { openCamera(texture, previewWidth, previewHeight) }
                     }
                 }
             }
@@ -1434,7 +1443,6 @@ class CameraEngine(private val context: Context) {
         }
     }
 
-    @Volatile private var pendingZoomRatio: Float? = null
     @Volatile private var zoomUpdateQueued = false
     @Volatile private var lensSwitchQueued = false
 
@@ -1442,6 +1450,7 @@ class CameraEngine(private val context: Context) {
      * Coalesce fast touch updates onto Camera2's handler. This keeps binder work out
      * of Compose's input path while always applying the most recent finger position.
      */
+    @Synchronized
     fun setZoomRatio(zoomRatio: Float) {
         val supportedZoom = zoomRatio
             .takeIf(Float::isFinite)
@@ -1459,11 +1468,13 @@ class CameraEngine(private val context: Context) {
                 lensSwitchQueued = true
                 val texture = previewSurfaceTexture
                 backgroundHandler?.post {
-                    lensSwitchQueued = false
-                    if (texture == null || texture.isReleased) return@post
-                    if (desiredCameraId == activeCameraId) return@post
-                    closeCamera()
-                    openCamera(texture, previewWidth, previewHeight)
+                    synchronized(this@CameraEngine) {
+                        lensSwitchQueued = false
+                        if (texture == null || texture.isReleased) return@post
+                        if (desiredCameraId == activeCameraId) return@post
+                        closeCamera()
+                        openCamera(texture, previewWidth, previewHeight)
+                    }
                 } ?: run { lensSwitchQueued = false }
             }
             return
@@ -1472,24 +1483,19 @@ class CameraEngine(private val context: Context) {
         val hardwareZoom = profile.hardwareZoomFor(supportedZoom, base)
         currentZoomRatio = supportedZoom
         currentHardwareZoomRatio = hardwareZoom
-        pendingZoomRatio = hardwareZoom
+        dispatchZoomState()
         if (zoomUpdateQueued) return
         zoomUpdateQueued = true
         backgroundHandler?.post {
-            while (true) {
-                val nextZoom = pendingZoomRatio ?: break
-                pendingZoomRatio = null
-                applyZoomRatio(nextZoom)
-                if (pendingZoomRatio == null) break
-            }
-            zoomUpdateQueued = false
-            // Cover a new gesture update that arrived while the queue flag was reset.
-            pendingZoomRatio?.let { pendingHardwareZoom ->
-                pendingZoomRatio = null
-                applyZoomRatio(pendingHardwareZoom)
+            synchronized(this@CameraEngine) {
+                zoomUpdateQueued = false
+                // Read the latest target at execution, not an old hardware ratio
+                // computed for a lens that may have been replaced in the meantime.
+                if (desiredCameraId == activeCameraId) {
+                    applyZoomRatio(currentHardwareZoomRatio)
+                }
             }
         } ?: run { zoomUpdateQueued = false }
-        dispatchZoomState()
     }
 
     private fun applyZoomRatio(supportedZoom: Float) {
@@ -1497,7 +1503,7 @@ class CameraEngine(private val context: Context) {
         val session = captureSession ?: return
         try {
             applyZoomToRequest(builder, supportedZoom)
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Error setting zoom ratio", e)
         }
@@ -1577,62 +1583,47 @@ class CameraEngine(private val context: Context) {
         disableOptionalImageProcessing(builder)
     }
 
+    private val previewCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            if (captureSession !== session) return
+            // Capture results describe earlier frames. The requested zoom is
+            // authoritative; feeding those results back into it reissues stale
+            // values and can undo a lens selection while frames are in flight.
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
+            val expTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 20000000L
+
+            currentIso = iso
+            currentExposureTimeNs = expTimeNs
+            if (manualIso == null && manualExposureTimeNs == null) {
+                baseAutoIso = iso
+                baseAutoExposureTimeNs = expTimeNs
+            }
+            val now = System.nanoTime()
+            if (now - lastTelemetryDispatchNanos >= 250_000_000L) {
+                lastTelemetryDispatchNanos = now
+                currentShutterStr = formatExposureTime(expTimeNs)
+                val telemetry = TelemetryData(
+                    iso = currentIso,
+                    shutterSpeed = currentShutterStr,
+                    exposureTimeNs = currentExposureTimeNs,
+                    format = captureFormat,
+                    exposureCompensation = exposureCompensationEv,
+                    isoManual = manualIso != null,
+                    shutterManual = manualExposureTimeNs != null
+                )
+                mainHandler.post { onTelemetryListener?.invoke(telemetry) }
+            }
+        }
+    }
+
     private fun startPreviewRepeatingRequest() {
         try {
             val builder = previewRequestBuilder ?: return
-            captureSession?.setRepeatingRequest(builder.build(), object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    val confirmedHardwareZoom = result.get(CaptureResult.CONTROL_ZOOM_RATIO)
-                    if (
-                        confirmedHardwareZoom?.isFinite() == true &&
-                        captureSession === session &&
-                        desiredCameraId == activeCameraId
-                    ) {
-                        val profile = cameraProfiles.firstOrNull { it.id == activeCameraId }
-                        val base = baseEquivalentFocalLength
-                        if (profile != null && base != null) {
-                            currentHardwareZoomRatio = confirmedHardwareZoom
-                            val confirmedNormalizedZoom = if (profile.isPrimary) {
-                                confirmedHardwareZoom
-                            } else {
-                                profile.nativeEquivalentFocalLength / base * confirmedHardwareZoom
-                            }.coerceIn(minimumZoomRatio, maximumZoomRatio)
-                            if (kotlin.math.abs(confirmedNormalizedZoom - currentZoomRatio) > .005f) {
-                                currentZoomRatio = confirmedNormalizedZoom
-                                dispatchZoomState()
-                            }
-                        }
-                    }
-                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
-                    val expTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 20000000L
-
-                    currentIso = iso
-                    currentExposureTimeNs = expTimeNs
-                    if (manualIso == null && manualExposureTimeNs == null) {
-                        baseAutoIso = iso
-                        baseAutoExposureTimeNs = expTimeNs
-                    }
-                    val now = System.nanoTime()
-                    if (now - lastTelemetryDispatchNanos >= 250_000_000L) {
-                        lastTelemetryDispatchNanos = now
-                        currentShutterStr = formatExposureTime(expTimeNs)
-                        val telemetry = TelemetryData(
-                            iso = currentIso,
-                            shutterSpeed = currentShutterStr,
-                            exposureTimeNs = currentExposureTimeNs,
-                            format = captureFormat,
-                            exposureCompensation = exposureCompensationEv,
-                            isoManual = manualIso != null,
-                            shutterManual = manualExposureTimeNs != null
-                        )
-                        mainHandler.post { onTelemetryListener?.invoke(telemetry) }
-                    }
-                }
-            }, backgroundHandler)
+            captureSession?.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Error starting preview request", e)
         }

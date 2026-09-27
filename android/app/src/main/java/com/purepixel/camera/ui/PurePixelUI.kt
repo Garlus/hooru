@@ -151,49 +151,6 @@ private enum class ZoomDisplayUnit { RATIO, MILLIMETERS }
 private const val MaxActiveFilters = 10
 private const val ZoomDragSensitivity = .0075f
 
-private data class MagneticZoomResult(
-    val zoom: Float,
-    val activeMilestone: Float?
-)
-
-/**
- * Pulls the zoom progressively towards a physical lens without creating the broad,
- * flat dead zone of a hard snap. A small lock radius keeps the exact lens value
- * stable, while the wider release radius supplies enough hysteresis to avoid chatter.
- */
-private fun magneticZoom(
-    rawZoom: Float,
-    activeMilestone: Float?,
-    milestones: List<Float>
-): MagneticZoomResult {
-    if (milestones.isEmpty()) return MagneticZoomResult(rawZoom, null)
-
-    fun captureRadius(point: Float): Float = max(.035f, point * .035f).coerceAtMost(.16f)
-
-    val heldMilestone = activeMilestone
-        ?.takeIf { held ->
-            milestones.any { abs(it - held) < .001f } &&
-                abs(rawZoom - held) <= captureRadius(held) * 1.8f
-        }
-    val nearestMilestone = milestones.minByOrNull { abs(it - rawZoom) }
-    val milestone = heldMilestone ?: nearestMilestone?.takeIf {
-        abs(rawZoom - it) <= captureRadius(it)
-    } ?: return MagneticZoomResult(rawZoom, null)
-
-    val capture = captureRadius(milestone)
-    val distance = abs(rawZoom - milestone)
-    val lockRadius = capture * .22f
-    if (distance <= lockRadius) return MagneticZoomResult(milestone, milestone)
-
-    val releaseRadius = capture * 1.8f
-    val proximity = (1f - distance / releaseRadius).coerceIn(0f, 1f)
-    val attraction = proximity * proximity * .72f
-    return MagneticZoomResult(
-        zoom = rawZoom + (milestone - rawZoom) * attraction,
-        activeMilestone = milestone
-    )
-}
-
 /** Processing options are always available; only selectable looks consume the carousel limit. */
 private fun limitedFilterSelection(ids: Set<String>): Set<String> = buildSet {
     ids.asSequence()
@@ -844,9 +801,10 @@ fun PurePixelScreen(
         }
     }
 
-    // Apply the zoom value from the gesture directly. The previous spring animation
-    // made both the dial and the camera preview visibly trail the user's finger.
-    LaunchedEffect(currentZoom) {
+    // Only user input issues commands. Camera state notifications update the UI
+    // without feeding an asynchronous observation back into the camera.
+    fun requestZoom(ratio: Float) {
+        currentZoom = ratio.coerceIn(zoomState.minimumRatio, zoomState.maximumRatio)
         glView?.stopObjectTracking()
         cameraEngine.setZoomRatio(currentZoom)
     }
@@ -1180,7 +1138,7 @@ fun PurePixelScreen(
                                     )
                                     val stepped = kotlin.math.round(continuousZoom * 10f) / 10f
                                     if (stepped != latestCurrentZoom) {
-                                        currentZoom = stepped.coerceIn(zoomState.minimumRatio, zoomState.maximumRatio)
+                                        requestZoom(stepped)
                                         uiMode = UiStateMode.ZOOM_ACTIVE
                                         zoomInteractionCounter++
                                     }
@@ -1569,9 +1527,9 @@ fun PurePixelScreen(
                                                 milestones = zoomMilestones
                                             )
                                             activeZoomMilestone = magnetic.activeMilestone
-                                            val displayedZoom = (kotlin.math.round(magnetic.zoom * 100f) / 100f).coerceIn(zoomState.minimumRatio, zoomState.maximumRatio)
+                                            val displayedZoom = magnetic.zoom.coerceIn(zoomState.minimumRatio, zoomState.maximumRatio)
                                             val step = (displayedZoom * 5f).roundToInt()
-                                            currentZoom = displayedZoom
+                                            requestZoom(displayedZoom)
 
                                             if (magnetic.activeMilestone != null && previousMilestone == null) {
                                                 zoomInteractionCounter++
@@ -1595,11 +1553,11 @@ fun PurePixelScreen(
                             focalLengths = availableFocalLengths,
                             minimumZoom = zoomState.minimumRatio,
                             maximumZoom = zoomState.maximumRatio,
-                            equivalentFocalLength = zoomState.equivalentFocalLengthMillimeters,
+                            baseEquivalentFocalLength = zoomState.equivalentFocalLengthMillimeters?.let { it / zoomState.ratio },
                             displayUnit = zoomDisplayUnit,
                             endStopDirection = zoomEndStopDirection,
                             onSelectZoom = { ratio ->
-                                currentZoom = ratio.coerceIn(zoomState.minimumRatio, zoomState.maximumRatio)
+                                requestZoom(ratio)
                                 continuousZoom = currentZoom
                                 uiMode = UiStateMode.ZOOM_ACTIVE
                                 zoomInteractionCounter++
@@ -4030,7 +3988,7 @@ private fun ZoomPillDial(
     focalLengths: List<CameraEngine.FocalLengthOption>,
     minimumZoom: Float,
     maximumZoom: Float,
-    equivalentFocalLength: Float?,
+    baseEquivalentFocalLength: Float?,
     displayUnit: ZoomDisplayUnit,
     endStopDirection: Int,
     onSelectZoom: (Float) -> Unit
@@ -4112,12 +4070,14 @@ private fun ZoomPillDial(
                     tween(if (pressed || flashing) 65 else 260),
                     label = "zoomButtonBloom-$ratio"
                 )
-                val label = if (selected) {
-                    formatZoomValue(currentZoom, equivalentFocalLength, displayUnit)
-                } else if (displayUnit == ZoomDisplayUnit.MILLIMETERS) {
-                    val focal = focalLengths.firstOrNull { abs(it.zoomRatio - ratio) < .05f }
-                    val millimeters = focal?.millimeters ?: equivalentFocalLength?.let { it / currentZoom * ratio }
+                // Each mm button describes its fixed stop, even while selected.
+                // Never derive a stop label from telemetry divided by a newer UI zoom.
+                val label = if (displayUnit == ZoomDisplayUnit.MILLIMETERS) {
+                    val focal = focalLengths.firstOrNull { abs(it.zoomRatio - ratio) < .001f }
+                    val millimeters = focal?.millimeters ?: baseEquivalentFocalLength?.times(ratio)
                     formatZoomValue(ratio, millimeters, displayUnit)
+                } else if (selected) {
+                    formatZoomValue(currentZoom, null, displayUnit)
                 } else {
                     String.format(Locale.getDefault(), "%.1f", ratio).removeSuffix(",0").removeSuffix(".0")
                 }
